@@ -1,0 +1,122 @@
+# T19 (Caltech) — NXP ICLAD 2026 Submission
+
+Final agent for the NXP SoC Design Benchmark (`ICLAD26-NXP-Problems`, EASY
+problem). This folder is self-contained: it does not require placing anything
+inside the official hackathon repo. See `NOTES.md` for the full design
+rationale and comparison against T19's 18 prior agent iterations.
+
+## Layout
+
+```
+T19-Caltech-NXP-Submission/
+├── agent/
+│   └── t19_nxp_agent_final.py   ← the submission agent
+├── scripts/
+│   └── model_service.py         ← local Vertex AI Express Mode proxy, for testing
+├── requirements.txt
+├── NOTES.md                     ← design rationale / version comparison
+└── README.md                    ← this file
+```
+
+## Prerequisites
+
+1. The official problem repo, `ICLAD26-NXP-Problems`, checked out somewhere
+   on disk (it provides `runner/run_benchmark.py`, `evaluator/evaluate.py`,
+   `rtl_gen_lib/`, and the problem specs/testbenches - none of that is
+   duplicated here).
+2. Python 3.8+, `iverilog`/`vvp` 10.0+ (see that repo's `DEPENDENCIES.md`).
+3. `pip install -r requirements.txt` (just `google-genai`, needed by
+   `scripts/model_service.py`).
+4. A Vertex AI Express Mode API key:
+   ```bash
+   export EXPRESS_MODE_KEY="your_actual_api_key_here"
+   ```
+
+## Running
+
+**Terminal 1** - start the local model service (implements the exact
+`model_endpoint` contract from `AGENT_GUIDE.md`):
+
+```bash
+cd T19-Caltech-NXP-Submission
+python3 scripts/model_service.py --port 8080
+```
+
+**Terminal 2** - run the official benchmark runner, pointing `--agent` at
+this folder's agent and `--model-endpoint` at the service above:
+
+```bash
+cd <path-to>/ICLAD26-NXP-Problems
+python3 runner/run_benchmark.py \
+    --problem easy \
+    --agent <path-to>/T19-Caltech-NXP-Submission/agent/t19_nxp_agent_final.py \
+    --model gemini-2.5-flash \
+    --model-endpoint http://127.0.0.1:8080 \
+    --run-id t19_final_v1
+```
+
+Note: `gemini-2.0-flash-exp` (the default baked into `run_benchmark.py`/
+`AGENT_GUIDE.md`'s examples) returned 404s from Vertex AI during development -
+it appears to be a retired experimental model name. Use a current model
+(`gemini-2.5-flash` verified working) via `--model` as shown above.
+
+This writes generated RTL to `ICLAD26-NXP-Problems/result/t19_final_v1/easy/`
+and (since `--skip-eval` isn't passed) immediately runs the evaluator too.
+
+### Evaluating separately
+
+```bash
+python3 evaluator/evaluate.py \
+    --problem easy \
+    --rtl_dir result/t19_final_v1/easy/ \
+    --run_id  t19_final_v1
+
+cat factors/t19_final_v1/easy/easy_score.json
+```
+
+**Important limitation**: the golden testbench (`problems/easy/golden_tb/`)
+is intentionally hidden from participants, so this local evaluation step will
+always report `"Golden TB not found"` / `score: 0.0` — that is expected and
+is not a sign anything is broken. Local runs can only confirm two things pre-
+submission:
+
+1. **Generation completeness** - check that `result/t19_final_v1/easy/`
+   contains all 9 expected files (8 IP `.v` files + `secure_periph_soc.v`).
+2. **Syntactic validity and elaboration** - compile with the DUT itself as
+   the elaboration root (`-s secure_periph_soc`). Note:
+   `problems/easy/tb/tb_top_skeleton.v` is a port-contract *reference*, not a
+   runnable testbench - it declares some DUT-input signals as `wire` while
+   its own `initial` block procedurally assigns them (e.g. `uart_rx`,
+   `uart_cts_n`), which is invalid Verilog and fails elaboration regardless
+   of what RTL is submitted, so don't compile against it directly:
+   ```bash
+   cd ICLAD26-NXP-Problems
+   iverilog -g2005 -o /tmp/smoke_test -s secure_periph_soc result/t19_final_v1/easy/*.v
+   ```
+   A clean exit confirms our modules parse, elaborate, and connect correctly
+   as Verilog-2001 (`iverilog -g2005`-compatible) - confirmed via a real
+   end-to-end run with `gemini-2.5-flash` during development: all 8 IP files
+   + top-level generated correctly and this check passed with exit code 0.
+
+Real correctness/efficiency scoring only happens against the hidden golden
+testbench at organizer judging time.
+
+## Gemini 2.5 "thinking" gotcha (already handled in `scripts/model_service.py`)
+
+Gemini 2.5 models spend part of `max_output_tokens` on an internal "thinking"
+step before producing visible text. With a modest token budget, thinking
+alone can exhaust it - `finish_reason` comes back `MAX_TOKENS` with only a
+truncated fragment of real output (hit and fixed during development).
+`model_service.py` sets `thinking_config=ThinkingConfig(thinking_budget=0)` to
+disable this for this structured-generation task, which is also cheaper and
+faster. Keep this in mind if you swap in a different model server/config.
+
+## What's different from the starter/reference agents
+
+See `NOTES.md` for the full rationale. In short: this agent uses the same
+`model_endpoint` HTTP interface as `vertexai_express_agent.py` (mandatory per
+`AGENT_GUIDE.md` - direct SDK calls, which every one of T19's own prior
+versions used, are a contract violation), combined with the most reliable
+prompt-engineering ideas from T19's own iteration history (directed-graph
+topology extraction from the architecture diagram's SVG, and a hand-curated
+per-IP-type YAML schema).
