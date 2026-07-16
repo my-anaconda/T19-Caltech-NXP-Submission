@@ -20,14 +20,20 @@ T19-Caltech-NXP-Submission/
 
 ## Prerequisites
 
-1. The official problem repo, `ICLAD26-NXP-Problems`, checked out somewhere
-   on disk (it provides `runner/run_benchmark.py`, `evaluator/evaluate.py`,
-   `rtl_gen_lib/`, and the problem specs/testbenches - none of that is
-   duplicated here).
-2. Python 3.8+, `iverilog`/`vvp` 10.0+ (see that repo's `DEPENDENCIES.md`).
-3. `pip install -r requirements.txt` (just `google-genai`, needed by
+0. Clone this repo, and clone the official problem repo (it provides
+   `runner/run_benchmark.py`, `evaluator/evaluate.py`, `rtl_gen_lib/`, and the
+   problem specs/testbenches - none of that is duplicated here):
+   ```bash
+   git clone https://github.com/my-anaconda/T19-Caltech-NXP-Submission.git
+   git clone https://github.com/ICLAD-Hackathon/ICLAD26-NXP-Problems.git
+   ```
+   (`ICLAD26-NXP-Problems` is also reachable as a submodule of the top-level
+   `ICLAD-Hackathon-2026` repo, at `problem-categories/ICLAD26-NXP-Problems`,
+   if you're setting up the whole hackathon rather than just this problem.)
+1. Python 3.8+, `iverilog`/`vvp` 10.0+ (see that repo's `DEPENDENCIES.md`).
+2. `pip install -r requirements.txt` (just `google-genai`, needed by
    `scripts/model_service.py`).
-4. A Vertex AI Express Mode API key:
+3. A Vertex AI Express Mode API key:
    ```bash
    export EXPRESS_MODE_KEY="your_actual_api_key_here"
    ```
