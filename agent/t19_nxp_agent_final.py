@@ -79,13 +79,25 @@ IP_CONSTRAINTS = """
 - perf_counter: Requires [name, channels, counter_width]
 """
 
-# The 8 IP blocks the EASY problem's architecture.html always requires
-# (per AGENT_GUIDE.md / README.md's "IP Blocks" list). Used only to sanity-log
-# what's missing after YAML inference - does not force generation.
-EASY_EXPECTED_IPS = [
-    "reset_sync", "ahb_to_apb_bridge", "apb_fabric", "apb_uart",
-    "apb_gpio", "apb_timer", "apb_watchdog", "irq_aggregator",
-]
+# Per-problem IP-block checklists (per AGENT_GUIDE.md / README.md's "IP Blocks"
+# lists for each tier). Used only to sanity-log what's missing after YAML
+# inference - does not force generation. "medium"/"hard" list the ip_type
+# names (some instantiated multiple times under different `name`s).
+EXPECTED_IPS_BY_PROBLEM = {
+    "easy": [
+        "reset_sync", "ahb_to_apb_bridge", "apb_fabric", "apb_uart",
+        "apb_gpio", "apb_timer", "apb_watchdog", "irq_aggregator",
+    ],
+    "medium": [
+        "reset_sync", "tilelink_router", "tilelink_ni", "axi_lite_sram",
+        "aes128", "irq_aggregator",
+    ],
+    "hard": [
+        "reset_sync", "tilelink_router", "tilelink_ni", "axi_lite_sram",
+        "axi_lite_crossbar", "aes128", "dma_engine", "apb_fabric",
+        "apb_gpio", "apb_uart", "irq_aggregator", "perf_counter", "mailbox",
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -294,11 +306,24 @@ def extract_yaml_blocks(llm_output: str) -> list:
 
 
 def extract_verilog(llm_output: str) -> str:
+    """Strips the ```verilog ... ``` fence around the model's response.
+
+    Larger top-level modules (medium/hard have 10-20+ IP instances to wire,
+    vs. easy's flatter structure) can exhaust max_output_tokens before the
+    model emits a closing fence. When that happens there's no complete
+    ```...``` match, so fall back to stripping just a leading fence marker
+    (if present) rather than returning the raw text verbatim - which would
+    otherwise leave a literal ```verilog line as line 1 of the .v file,
+    guaranteed to fail elaboration on top of the truncation itself.
+    """
     if not llm_output:
         return ""
     pattern = r"`" * 3 + r"(?:verilog|systemverilog|v)?\s*(.*?)\s*" + r"`" * 3
     match = re.search(pattern, llm_output, flags=re.DOTALL | re.IGNORECASE)
-    return match.group(1).strip() if match else llm_output.strip()
+    if match:
+        return match.group(1).strip()
+    stripped = re.sub(r'^\s*`{3}\w*\s*\n?', '', llm_output)
+    return stripped.strip()
 
 
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
@@ -438,7 +463,8 @@ Task:
         generated_files.extend(rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir))
     print(f"[STEP3] Total generated: {len(generated_files)} file(s)", file=sys.stderr)
 
-    missing = [ip for ip in EASY_EXPECTED_IPS
+    expected_ips = EXPECTED_IPS_BY_PROBLEM.get(info["problem"], [])
+    missing = [ip for ip in expected_ips
                if not any(ip in Path(f).stem for f in generated_files)]
     if missing:
         print(f"[WARN] No generated file matched expected IP(s): {missing}", file=sys.stderr)
@@ -488,7 +514,11 @@ Do not include long explanations outside the code block.
 """
     verilog_response = call_model(
         info["model_endpoint"], prompt_verilog, model_name,
-        max_tokens=16384, max_retries=args.max_retries,
+        # medium/hard top-levels wire together 10-20+ IP instances (vs. easy's
+        # flatter structure) and were observed truncating mid-file at 16384
+        # (no closing ``` fence, cut off mid-instantiation) - 32768 gives
+        # enough headroom while still well under gemini-2.5-flash's limit.
+        max_tokens=32768, max_retries=args.max_retries,
         diagnostics_path=temp_dir / "soc_top_diagnostics.json",
     )
     (temp_dir / "soc_response.txt").write_text(verilog_response, encoding="utf-8")
@@ -497,8 +527,27 @@ Do not include long explanations outside the code block.
     if not top_level_verilog:
         print("[ERROR] Model failed to output Verilog for the top-level module.", file=sys.stderr)
         sys.exit(1)
+    if "endmodule" not in top_level_verilog:
+        # No closing fence AND no endmodule = the response was truncated
+        # mid-file (hit max_output_tokens before finishing), not just missing
+        # a fence marker. The file below WILL fail to compile - flagged loudly
+        # here rather than silently shipping a guaranteed-broken top level.
+        print("[ERROR] Top-level response has no 'endmodule' - looks truncated "
+              "(hit max_output_tokens before finishing). Writing it anyway for "
+              "inspection, but this file will not compile.", file=sys.stderr)
 
-    top_file_path = out_dir / "secure_periph_soc.v"
+    # Name the file after the module the LLM actually wrote (must match the
+    # tb_skeleton's DUT instantiation per the prompt above), not a hardcoded
+    # easy-tier name - evaluate.py globs **/*.v and only module names matter
+    # for compilation, but a correct filename keeps the output directory
+    # readable across problem tiers.
+    # Require '(' or '#' right after the identifier (real module declarations
+    # only) - a bare \bmodule\s+(\w+) also matches prose like "top-level
+    # module for the SoC" inside a leading `//` comment, which happened in
+    # testing and produced a file named "for.v" instead of the real module.
+    top_module_match = re.search(r'\bmodule\s+(\w+)\s*[(#]', top_level_verilog)
+    top_module_name = top_module_match.group(1) if top_module_match else info["problem"] + "_soc_top"
+    top_file_path = out_dir / f"{top_module_name}.v"
     top_file_path.write_text(top_level_verilog + "\n", encoding="utf-8")
     print(f"[DONE] Wrote top-level RTL to {top_file_path}", file=sys.stderr)
     print(f"[DONE] {len(generated_files) + 1} total Verilog file(s) in {out_dir}", file=sys.stderr)

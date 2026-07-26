@@ -115,3 +115,148 @@ end-to-end against it (`run_benchmark.py --problem easy`, real
 Both checks passing confirms the submission still works correctly against
 the organizers' latest problem-repo revision, not just the version it was
 originally developed against.
+
+## Extending to medium/hard (2026-07-26)
+
+`t19_nxp_agent_final.py` was already written problem-agnostically (reads
+`info["problem"]`, `architecture_doc`, and `tb_skeleton` dynamically, and its
+hand-curated `IP_CONSTRAINTS` schema already covered every `ip_type` medium
+needs: `tilelink_router`, `tilelink_ni`, `aes128`, `axi_lite_sram`,
+`irq_aggregator`, `reset_sync`). Two hardcoded easy-tier assumptions were
+generalized rather than forking a separate agent file (see "Why v16 is the
+architectural base" above for why this codebase avoids per-version/per-tier
+proliferation):
+
+- `EASY_EXPECTED_IPS` (a fixed 8-item list used only for a non-blocking
+  sanity-log warning) became `EXPECTED_IPS_BY_PROBLEM`, keyed by problem.
+- The output top-level file was hardcoded to `secure_periph_soc.v`
+  regardless of problem. Harmless for compilation (`evaluate.py` globs
+  `**/*.v` and only module *names* matter), but confusing to inspect. Now
+  named after the module the LLM actually wrote, extracted via
+  `module\s+(\w+)\s*[(#]`.
+
+**Note:** `runner/run_benchmark.py` in the organizers' `ICLAD26-NXP-Problems`
+repo only accepts `--problem easy` right now (`PROBLEMS = ["easy"]`,
+docstring says "medium and hard coming in a future release") even though
+`evaluator/evaluate.py` already has full `medium`/`hard` configs and
+`problems/medium/`, `problems/hard/` already exist with real
+`docs/architecture.html` + `tb/tb_top_skeleton.v`. To test medium locally, a
+one-off harness script built `info.json` by hand (mirroring
+`write_info_json`'s exact shape: `architecture_doc`, `tb_skeleton`,
+`rtl_gen_lib`, `output_dir`, `temp_dir`, `usage_path`), started
+`model_service.py` manually, ran the agent, then ran `evaluator/evaluate.py
+--problem medium` (which works fine standalone) plus an `iverilog`
+elaboration pass against `problems/medium/tb/tb_top_skeleton.v`. This harness
+isn't part of the submission (the gap is organizer-side, not ours) - just
+documenting the method here in case medium/hard testing needs to be redone
+before `run_benchmark.py` catches up.
+
+### Real bug found and fixed: top-level truncation on medium
+
+First real run (`t19_medium_test1`) generated all 22 expected IP files
+correctly (1 reset_sync + 6 routers + 6 NIs + 6 SRAMs + 2 AES + 1 irq_agg,
+matching the "Node IP Inventory" table exactly), but the top-level
+`noc_aes_soc.v` failed to elaborate: `iverilog` reported a syntax error at
+line 1, which was a literal ` ```verilog ` fence marker. Root cause: the
+Step 4 top-level call used `max_tokens=16384` (unchanged from easy), and
+medium's top level - wiring together 22 IP instances vs. easy's flatter
+8-block structure - is much more verbose. The raw response
+(`temp/.../soc_response.txt`) confirmed it: 755 lines, cut off mid
+`u_sram_02` instantiation, with only an *opening* fence and no closing one.
+`extract_verilog()`'s regex requires a matching closing fence to strip
+anything, so on no-match it fell back to returning the raw text verbatim -
+fence marker included - producing a guaranteed-broken file silently.
+
+Fix (both applied to `t19_nxp_agent_final.py`, used by every tier):
+- Bumped the Step 4 call's `max_tokens` from 16384 to 32768.
+- `extract_verilog()` now strips a leading fence marker even when no closing
+  fence is found, instead of returning the raw text verbatim.
+- Added an explicit `endmodule` presence check after extraction that prints
+  a loud `[ERROR] ... looks truncated` if missing, so a future truncation
+  (e.g. if hard's even-larger top level exceeds 32768 too) fails loudly
+  instead of silently shipping a broken file.
+
+Re-run (`t19_medium_test2`) with the fix completed cleanly: no truncation
+warning, `noc_aes_soc.v` ends in a proper `endmodule`, and `iverilog -g2005
+-o smoke_test -s tb_top *.v problems/medium/tb/tb_top_skeleton.v` elaborated
+with **exit code 0 and zero warnings**. Spot-checked (via `grep`) that all 21
+required instance names from the architecture doc's naming-convention table
+(`u_rst`, `u_router_00`..`u_router_12`, `u_ni_00`..`u_ni_12`,
+`u_sram_00`..`u_sram_12`, `u_aes0`, `u_aes1`, `u_irq_agg`) and both required
+tie-off wire names (`tie_02_p0_a_valid`, `tie_00_p1_a_valid`) are present in
+the generated top-level file.
+
+### Real regression caught by re-verifying easy after the change
+
+Editing a file shared across all three tiers means every change needs
+re-verification against the *other* tiers, not just the one being worked on
+- re-ran easy (`t19_easy_regress_check2`) through the actual
+`runner/run_benchmark.py --problem easy` (not the manual harness, since
+easy is the one tier the real runner supports) and it produced a file named
+`for.v` instead of `secure_periph_soc.v`. Cause: the new module-name
+extraction regex (`module\s+(\w+)`, no anchor) matched the word "module"
+inside a *comment line* the model had written above the real declaration -
+`// Top-level module for the Secure Peripheral Subsystem SoC.` - capturing
+"for" as the module name. Fixed by requiring `(` or `#` immediately after
+the captured identifier (`module\s+(\w+)\s*[(#]`), which only matches a real
+declaration. Re-ran (`t19_easy_regress_check3`): file now correctly named
+`secure_periph_soc.v`, and a design-only `iverilog -g2005 -s
+secure_periph_soc *.v` elaboration (the same method validated in the
+2026-07-26 easy re-verification above - `tb_top_skeleton.v` for easy itself
+contains SystemVerilog-only task syntax that `-g2005` rejects, unrelated to
+our generated RTL, so it's excluded from this specific check exactly as
+before) passed with exit code 0. No regression once this fix was in.
+
+### Known, unresolved structural risk: NoC forwarding (not fixed - flagged for judgment)
+
+Reading `rtl_gen_lib/gen_noc_ips.py`'s `gen_tilelink_router` closely: every
+compass port (N/S/E/W) is generated with the *same* fixed direction on every
+router instance - A-channel is `input` (this router as slave, receiving a
+request), D-channel is `output` (sending a response back) - with no
+complementary "master" side on any of those four ports (only the `Local`
+port toward the NI has the opposite direction). Architecture.html's own
+wiring principle says router_00's East port (p2) and router_10's West port
+(p3) "are the same physical wires - they must be connected together." But
+since both are declared `input` for their A-channel, wiring them together at
+the top level ties two inputs to the same net with no driver on either side
+- there is no configuration of top-level glue logic that makes an
+originating (non-local) packet actually traverse from one router instance to
+its neighbor, because neither side of the link is ever a source. This would
+block real 2-hop/EW/NS routing (`noc_ew_routing`, `noc_ns_routing`,
+`noc_2hop` - roughly 13 of medium's ~55 hidden tests per `evaluate.py`'s
+category list), independent of how good the top-level stitching is.
+
+There's a second, related open question: `gen_tilelink_ni` is fixed as
+"AXI slave in -> TL-UL master out" (matching only the CPU-entry role at node
+0,0), but the architecture doc requires one NI instance *per node*
+(`u_ni_00`..`u_ni_12`), including at the 5 nodes with no upstream AXI master
+of their own - it's not obvious from the provided library what role NI plays
+there (delivering a router's local-port packet to that node's SRAM would
+need the *opposite* bridge direction, which the generator doesn't provide).
+
+This was deliberately **not patched**: a correct fix means hand-authoring a
+real bidirectional-forwarding router (and possibly a second NI role) from
+scratch, and - unlike the ASU DRC work, where every candidate fix could be
+checked against the real KLayout/connectivity checker - there is no local
+oracle here at all (golden TB is hidden for every tier), so a hand-rolled
+protocol redesign could look internally consistent while still being wrong,
+with no way to catch it before organizer judging. Flagging this precisely
+instead of guessing further is the same judgment call as `V0.M1.AUX.3`/
+`M4.AUX.2` on the ASU side: documented as a known risk rather than shipped
+as an unverified "fix."
+
+### Status: medium generation verified, hard not attempted this session
+
+Per instruction, work stopped after medium was tested. Hard tier
+(`crypto_soc`) was not attempted - `problems/hard/docs/architecture.html`
+(939 lines) and its tb skeleton were read only enough to build the IP
+checklist above; the actual agent run against `--problem hard` is still
+open. Given hard reuses the same `tilelink_router`/`tilelink_ni` NoC
+subsystem as medium, the structural risk above applies there too, plus hard
+introduces one wholly new `ip_type` with **no generator in
+`rtl_gen_lib` at all**: `mailbox` (needed for the `mbox_dout`/`mbox_rd_en`/
+`mbox_empty` ports in `tb_crypto_soc`). Since `rtl_gen_from_yaml` silently
+skips unknown `ip_type`s (catches the `CalledProcessError` and returns
+`[]`), the agent's existing Step 4 fallback text ("if none generated, write
+minimal stub instances or inline logic as needed") would have to carry the
+entire mailbox implementation via the top-level LLM call alone - untested.
