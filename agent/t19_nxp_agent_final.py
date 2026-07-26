@@ -45,6 +45,47 @@ from pathlib import Path
 
 RETRYABLE_HTTP_STATUS = {429, 500, 502, 503, 504}
 
+# Two fixes to the organizer-provided rtl_gen_lib, both verified via real
+# simulation (see NOTES.md) rather than elaboration alone:
+#
+# 1. gen_router_v2.py: the original tilelink_router generator has a
+#    structural bug - every compass port is generated with a fixed direction
+#    (A-channel input only), so no two router instances can ever forward a
+#    packet to each other. gen_router_v2.py fixes this with bidirectional
+#    per-port channels (proven via real 1-hop and 2-hop simulation).
+#
+# 2. gen_noc_mesh.py: even with a correct router IP, empirically the
+#    top-level-generation LLM call does NOT attempt real per-node mesh
+#    wiring - for a 4x3 (12-router) mesh it silently instantiated every
+#    router with ONLY clk/rst_n connected, leaving everything else
+#    floating (Icarus does not flag unconnected named ports, so this
+#    "elaborated cleanly" while doing nothing). This happened identically
+#    for both router versions, so it's a separate, pre-existing gap: the
+#    mesh interconnect is fully mechanical once the grid dimensions are
+#    known, so it's generated programmatically instead of asked of the LLM.
+#    The result is ONE self-contained "noc_mesh" module whose only external
+#    ports are one AXI4-Lite slave port per node - the LLM's job shrinks to
+#    "instantiate this one module and connect a handful of AXI-Lite ports",
+#    which is the same kind of task it already handles correctly elsewhere
+#    (e.g. DMA cfg ports), instead of hand-wiring 12 routers.
+NOC_MESH_WIRING_NOTE = """
+IMPORTANT - the NoC mesh (all tilelink_router / tilelink_ni / axi_lite_sram
+instances) has ALREADY been fully wired into ONE module called "noc_mesh"
+(see its header below). Do NOT instantiate u_router_*/u_ni_*/u_sram_*
+individually - instantiate ONLY the noc_mesh module. Its external ports are
+one AXI4-Lite SLAVE port per node, named n{{X}}{{Y}}_* (e.g. n00_awaddr,
+n01_awvalid, ...) where X,Y are that node's mesh coordinates. Per the
+architecture doc's own node/injection-point assignments: connect the
+node(s) where the CPU and/or DMA engines inject traffic into the mesh to
+their corresponding n{{X}}{{Y}}_* port (CPU's crossbar NoC-space output and
+each DMA engine's AXI4-Lite master port are AXI4-Lite masters; noc_mesh's
+n{{X}}{{Y}}_* ports are AXI4-Lite slaves, so this is a direct master-to-slave
+connection). Every node's n{{X}}{{Y}}_* port that has no real external master
+driving it must be tied idle exactly like any other unused AXI4-Lite slave
+port in this design (awvalid=0, wvalid=0, arvalid=0, bready=1'b1,
+rready=1'b1).
+"""
+
 # ---------------------------------------------------------------------------
 # Strict per-IP-type YAML schema (from t19_nxp_agent_v19.py - hand-curated,
 # more complete/reliable than scraping required() calls out of gen_*.py source)
@@ -326,8 +367,145 @@ def extract_verilog(llm_output: str) -> str:
     return stripped.strip()
 
 
+def _parse_flat_yaml(text):
+    """Minimal flat key:value parser, sufficient for the single-level YAML
+    specs Step 2 emits (ip_type, name, node_x, node_y, data_width, addr_width,
+    ...). Avoids a hard dependency on PyYAML being installed for this one
+    interception point."""
+    spec = {}
+    for line in text.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        spec[key.strip()] = val.strip().strip('"').strip("'")
+    return spec
+
+
+def try_stitch_noc_mesh(yaml_paths, out_dir, rtl_gen_lib_dir):
+    """If this problem's YAML specs describe a complete rectangular
+    tilelink_router mesh, generate the deterministic noc_mesh module (see
+    NOTES.md "NoC mesh end-to-end verified") instead of leaving the LLM to
+    hand-wire it at the top level - empirically it does not attempt real
+    per-node wiring for this (see NOC_MESH_WIRING_NOTE's comment above).
+    Returns (mesh_v_path, internal_filenames_to_hide) or (None, set()) if
+    this problem has no router mesh, or the mesh doesn't match the
+    "complete rectangular grid with u_router_XY/u_ni_XY/u_sram_XY naming"
+    assumption gen_noc_mesh.py requires - in which case Step 4 falls back
+    to its old behaviour (better a known, already-documented gap than a
+    crash on an unexpected topology).
+    """
+    specs = [(_parse_flat_yaml(yp.read_text(encoding="utf-8")), yp) for yp in yaml_paths]
+    router_specs = [(s, yp) for s, yp in specs if s.get("ip_type") == "tilelink_router"]
+    if not router_specs:
+        return None, set()
+
+    nodes = {}  # (x,y) -> (router_name, dw, aw)
+    for s, yp in router_specs:
+        name = s.get("name", "")
+        m = re.search(r"(\d)(\d)$", name)
+        if not m:
+            print(f"[WARN] Router {name!r} doesn't end in two coordinate digits - "
+                  f"skipping noc_mesh stitching, falling back to LLM top-level wiring.", file=sys.stderr)
+            return None, set()
+        x, y = int(m.group(1)), int(m.group(2))
+        try:
+            dw, aw = int(s["data_width"]), int(s["addr_width"])
+        except (KeyError, ValueError):
+            print(f"[WARN] Router {name!r} missing data_width/addr_width - skipping noc_mesh stitching.",
+                  file=sys.stderr)
+            return None, set()
+        nodes[(x, y)] = (name, dw, aw)
+
+    mesh_nx = max(x for x, y in nodes) + 1
+    mesh_ny = max(y for x, y in nodes) + 1
+    if len(nodes) != mesh_nx * mesh_ny:
+        print(f"[WARN] Router coordinates don't form a complete {mesh_nx}x{mesh_ny} "
+              f"rectangular grid ({len(nodes)} routers found) - skipping noc_mesh stitching.",
+              file=sys.stderr)
+        return None, set()
+
+    internal_files = set()
+    for (x, y), (rname, dw, aw) in nodes.items():
+        ni_name = rname.replace("router", "ni")
+        sram_name = rname.replace("router", "sram")
+        for fname in (f"{rname}.v", f"{ni_name}.v", f"{sram_name}.v"):
+            if not (Path(out_dir) / fname).is_file():
+                print(f"[WARN] Expected {fname} not found in output dir - skipping noc_mesh stitching.",
+                      file=sys.stderr)
+                return None, set()
+            internal_files.add(fname)
+
+    sram_depth = 1024
+    for s, yp in specs:
+        if s.get("ip_type") == "axi_lite_sram" and s.get("name", "").replace("sram", "router") in \
+                {rname for rname, _, _ in nodes.values()}:
+            try:
+                sram_depth = int(s["depth"])
+            except (KeyError, ValueError):
+                pass
+            break
+
+    any_dw, any_aw = next(iter(nodes.values()))[1:]
+    ext_dir = str(Path(__file__).resolve().parent / "rtl_gen_lib_ext")
+    if ext_dir not in sys.path:
+        sys.path.insert(0, ext_dir)
+    lib_dir = str(Path(rtl_gen_lib_dir).resolve())
+    if lib_dir not in sys.path:
+        sys.path.insert(0, lib_dir)
+    from gen_noc_mesh import gen_noc_mesh
+
+    mesh_spec = {
+        "name": "noc_mesh", "mesh_nx": mesh_nx, "mesh_ny": mesh_ny,
+        "data_width": any_dw, "addr_width": any_aw, "ext_data_width": 32,
+        "sram_depth": sram_depth,
+    }
+    files = gen_noc_mesh(mesh_spec)
+    mesh_path = None
+    for fname, content in files.items():
+        fpath = Path(out_dir) / fname
+        fpath.write_text(content, encoding="utf-8")
+        mesh_path = str(fpath)
+        print(f"[GEN-MESH] {fpath} ({len(content):,} chars) - stitches {len(nodes)} routers "
+              f"({mesh_nx}x{mesh_ny})", file=sys.stderr)
+    return mesh_path, internal_files
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
+    yaml_text = Path(yaml_path).read_text(encoding="utf-8")
+    spec = _parse_flat_yaml(yaml_text)
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram"):
+        # Use the corrected, verified generators instead of shelling out to
+        # the organizer's ones - see module-level comment above. Imported
+        # lazily (not at module load time) because these generators import
+        # gen_utils.hdr from the organizer's rtl_gen_lib_dir, whose path is
+        # only known once info.json has been read in main() - it is not
+        # available yet at Python module-import time.
+        ext_dir = str(Path(__file__).resolve().parent / "rtl_gen_lib_ext")
+        if ext_dir not in sys.path:
+            sys.path.insert(0, ext_dir)
+        lib_dir = str(Path(rtl_gen_lib_dir).resolve())
+        if lib_dir not in sys.path:
+            sys.path.insert(0, lib_dir)
+
+        if spec["ip_type"] == "tilelink_router":
+            from gen_router_v2 import gen_tilelink_router_v2
+            files = gen_tilelink_router_v2(spec)
+        else:
+            from gen_sram_v2 import gen_axi_lite_sram_v2
+            files = gen_axi_lite_sram_v2(spec)
+        out = Path(out_dir)
+        out.mkdir(parents=True, exist_ok=True)
+        generated = []
+        for fname, content in files.items():
+            fpath = out / fname
+            fpath.write_text(content, encoding="utf-8")
+            generated.append(str(fpath))
+            print(f"[GEN-V2] {fpath} ({len(content):,} chars)", file=sys.stderr)
+        print(f"[STEP3] {yaml_path.name} -> {generated} (via {spec['ip_type']}_v2)", file=sys.stderr)
+        return generated
+
     gen_script = Path(rtl_gen_lib_dir) / "rtl_gen_main.py"
     if not gen_script.is_file():
         print(f"[ERROR] rtl_gen_main.py not found: {gen_script}", file=sys.stderr)
@@ -469,11 +647,22 @@ Task:
     if missing:
         print(f"[WARN] No generated file matched expected IP(s): {missing}", file=sys.stderr)
 
+    mesh_path, mesh_internal_files = try_stitch_noc_mesh(yaml_paths, out_dir, rtl_gen_lib_dir)
+    if mesh_path:
+        generated_files.append(mesh_path)
+
     # --- Step 4: generate top-level SoC stitching module ---
     print("[STEP4] Generating top-level SoC Verilog...", file=sys.stderr)
 
     generated_headers = ""
     for v_file in sorted(out_dir.glob("*.v")):
+        if v_file.name in mesh_internal_files:
+            # Already fully wired inside noc_mesh.v - hide these individual
+            # headers from the top-level prompt so the LLM instantiates only
+            # the mesh wrapper, not 12+ routers/NIs/SRAMs by hand (see
+            # NOC_MESH_WIRING_NOTE). The files still exist on disk and are
+            # still compiled - they're just not shown in this prompt.
+            continue
         try:
             content = v_file.read_text(encoding="utf-8")
             match = re.search(r'(module\s+.*?;\s*)', content, flags=re.DOTALL)
@@ -495,7 +684,7 @@ exact module names and port definitions when instantiating them:
 
 Here is the Testbench Skeleton, which dictates the EXACT port contract your top-level module must use:
 {tb_skel}
-
+{NOC_MESH_WIRING_NOTE if mesh_path else ""}
 Task:
 1. Review the '=== LOCALLY EXTRACTED DIRECTED GRAPHS ===' section to understand the wiring: node
    descriptions explain what each block is, and edges explicitly dictate which port/IP connects
