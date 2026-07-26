@@ -297,3 +297,70 @@ directly, no NI on the local path" - probably also giving the router its
 own embedded local-delivery AXI-master logic rather than relying on NI for
 that path) is now planned as real work, not just a flagged concern. Not
 started as of this note.
+
+### Router forwarding fix: built and verified working (2026-07-26)
+
+Wrote a corrected router generator (`gen_router_v2.py`, prototyped outside
+the organizer's `rtl_gen_lib` - not modifying their file directly) with two
+real fixes over the original:
+
+1. **True bidirectional per-direction ports.** Each compass port (N/S/E/W)
+   now has two independent channel pairs instead of one: a slave pair
+   (`p{i}_s_*`, this router receiving from that neighbour) and a master
+   pair (`p{i}_m_*`, this router sending to that neighbour). At the top
+   level, router A's `p{X}_m_*` (master, facing neighbour B) wires to
+   router B's `p{Y}_s_*` (slave, facing A) where X/Y are opposite compass
+   directions - and vice versa for the return direction. This is what the
+   original design structurally could not do (every port was slave-only).
+2. **Embedded local-delivery AXI master**, per the hard doc's detail that
+   "the router drives its AXI ports directly - no NI on the local path":
+   the router now has its own `sram_*` AXI4-Lite master port, driven by a
+   single-outstanding-transaction FSM (`S_IDLE -> S_SEND -> S_WAIT ->
+   S_REPLY`) that arbitrates 5 inbound sources (local inject + 4 neighbour
+   slave ports), computes XY routing from the address, and either delivers
+   locally (via the embedded AXI master) or forwards out the correct
+   master port - then routes the eventual D-channel response back to
+   whichever source originated the request.
+
+**Two real bugs caught by actually simulating, not just compiling** (both
+now fixed in `gen_router_v2.py`):
+- `chan_ports()` computed the correct `wire`/`reg` type per direction but
+  never used it - every port was hardcoded `wire`, which fails to compile
+  for any output later driven by a procedural `always` block (needed
+  `reg`). Caught immediately by the standalone compile-check.
+- Duplicate/conflicting state-transition logic for the local-delivery case
+  in `S_SEND`: an old, buggy one-line condition (`if (sram_awready ||
+  sram_arready || ...)`) was left alongside a newer, correct if/else block
+  checking `sram_awready && sram_wready` for writes. The buggy line fired
+  first (since `sram_awready` alone was already true), advancing the FSM
+  out of `S_SEND` one cycle before the write-data handshake actually
+  completed - the write's *address* phase would succeed but the *data*
+  never landed. This one was NOT caught by elaboration or even a basic
+  "does it compile" check - only found by writing a real 2-router
+  testbench (`tb_router_forward.v`) with an actual memory model and
+  checking the data value that landed, not just that signals toggled.
+
+**Verified with a real simulation**, not just elaboration: two router
+instances (A at node (0,0), B at node (1,0), wired via the real link
+convention above), a fake but genuine SRAM model behind B, and a WRITE
+injected at A's local port addressed to node (1,0). Result:
+```
+[115000] B's SRAM received WRITE: addr=3 data=deadbeefcafef00d
+[PASS] Cross-router forward WORKED: B's memory[3] = deadbeefcafef00d
+[PASS] Write-ack D-channel response returned to A's local port.
+SCORE: 1/1
+```
+The write genuinely traverses the link, lands in B's memory with the
+correct data, and the write-ack correctly returns to A - the exact
+mechanism that was structurally impossible before. This is the single most
+important verification in this NXP track's work so far, since it's real
+simulated behavior, not elaboration or generation completeness.
+
+**Not yet done**: wiring this corrected router into the actual agent
+pipeline (replacing the `rtl_gen_lib` call for `ip_type: tilelink_router`
+with this generator), a 2-hop test (X-then-Y direction, matching the
+architecture docs' own worked examples) to confirm chained forwarding
+through a third router, and read-transaction testing (the docs note reads
+to remote nodes are a known limitation even in the reference design, so
+this may not need full support - see medium/hard doc callouts on the
+D-channel limitation).
