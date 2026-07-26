@@ -514,11 +514,12 @@ Do not include long explanations outside the code block.
 """
     verilog_response = call_model(
         info["model_endpoint"], prompt_verilog, model_name,
-        # medium/hard top-levels wire together 10-20+ IP instances (vs. easy's
+        # medium/hard top-levels wire together 10-35+ IP instances (vs. easy's
         # flatter structure) and were observed truncating mid-file at 16384
-        # (no closing ``` fence, cut off mid-instantiation) - 32768 gives
-        # enough headroom while still well under gemini-2.5-flash's limit.
-        max_tokens=32768, max_retries=args.max_retries,
+        # (no closing ``` fence, cut off mid-instantiation) - hard's ~34-instance
+        # SoC (4x3 NoC mesh + dual DMA/AES/IRQ + APB cluster + mailbox/perf) is
+        # substantially bigger than medium, so use a large ceiling here too.
+        max_tokens=65536, max_retries=args.max_retries,
         diagnostics_path=temp_dir / "soc_top_diagnostics.json",
     )
     (temp_dir / "soc_response.txt").write_text(verilog_response, encoding="utf-8")

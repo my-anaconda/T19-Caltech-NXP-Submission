@@ -1,9 +1,11 @@
 # T19 (Caltech) — NXP ICLAD 2026 Submission
 
-Final agent for the NXP SoC Design Benchmark (`ICLAD26-NXP-Problems`, EASY
-problem). This folder is self-contained: it does not require placing anything
-inside the official hackathon repo. See `NOTES.md` for the full design
-rationale and comparison against T19's 18 prior agent iterations.
+Final agent for the NXP SoC Design Benchmark (`ICLAD26-NXP-Problems`) -
+covers all three tiers (`easy`/`medium`/`hard`) via the same agent and the
+`--problem` flag. This folder is self-contained: it does not require placing
+anything inside the official hackathon repo. See `NOTES.md` for the full
+design rationale, the medium/hard extension work, and comparison against
+T19's 18 prior agent iterations.
 
 ## Layout
 

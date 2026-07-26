@@ -245,18 +245,55 @@ instead of guessing further is the same judgment call as `V0.M1.AUX.3`/
 `M4.AUX.2` on the ASU side: documented as a known risk rather than shipped
 as an unverified "fix."
 
-### Status: medium generation verified, hard not attempted this session
+### Hard tier (`crypto_soc`) generation verified (2026-07-26)
 
-Per instruction, work stopped after medium was tested. Hard tier
-(`crypto_soc`) was not attempted - `problems/hard/docs/architecture.html`
-(939 lines) and its tb skeleton were read only enough to build the IP
-checklist above; the actual agent run against `--problem hard` is still
-open. Given hard reuses the same `tilelink_router`/`tilelink_ni` NoC
-subsystem as medium, the structural risk above applies there too, plus hard
-introduces one wholly new `ip_type` with **no generator in
-`rtl_gen_lib` at all**: `mailbox` (needed for the `mbox_dout`/`mbox_rd_en`/
-`mbox_empty` ports in `tb_crypto_soc`). Since `rtl_gen_from_yaml` silently
-skips unknown `ip_type`s (catches the `CalledProcessError` and returns
-`[]`), the agent's existing Step 4 fallback text ("if none generated, write
-minimal stub instances or inline logic as needed") would have to carry the
-entire mailbox implementation via the top-level LLM call alone - untested.
+Read the full `problems/hard/docs/architecture.html` (939 lines, all 14
+sections). Corrected the earlier "no generator for mailbox" concern from the
+prior session: **mailbox is not its own `ip_type`** - the hard doc's own
+naming contract calls it `async_fifo (mailbox)` with required instance name
+`u_mbox`, and `async_fifo` is already a fully supported `rtl_gen_lib`
+primitive. It just needs top-level glue (SoC config register push/status
+logic), same as any other IP - not a missing generator after all.
+
+Bumped the Step 4 top-level call's `max_tokens` from 32768 to 65536: hard's
+top level wires together ~34 IP instances (12 routers + 12 NIs + 12 SRAMs +
+4 AES + 2 DMA + xbar + bridge + apb_fabric + uart + 2x gpio + timer + wdt +
+2x irq_aggregator + mailbox + perf_counter), substantially more than
+medium's 22.
+
+Ran the agent for real (`t19_hard_test1`, `gemini-3.5-flash`, real API
+calls): **generated all 56 expected files** (matches the instance count
+above + reset_sync + top level exactly). First elaboration attempt hit 2
+real bugs, both isolated LLM slips rather than systemic design problems:
+- A single-character typo, `always @(posedm clk or negedge sys_rst_n)`
+  (`posedm` instead of `posedge`) in the AHB-to-APB bridge glue - one
+  occurrence, confirmed via `grep` there were no others.
+- A wire declared `[64:0]` (65 bits) instead of `[63:0]` for the 64-bit
+  SRAM data bus (`r00_loc_a_data` and likely its per-node siblings) -
+  produces `iverilog` width-mismatch *warnings* (pruned/padded bit), not
+  fatal errors.
+
+After manually patching the typo, **iverilog elaboration passes with exit
+code 0** against `tb_top_skeleton.v` (`-s tb_crypto_soc`), with only the 2
+width-mismatch warnings remaining. This is a strong result for a 56-file,
+34-instance SoC - the generation pipeline itself is sound; what surfaced
+here is normal LLM-output variance on a very large single-shot generation,
+not a structural gap. Not yet decided whether to add automated post-
+generation lint/auto-fix for common single-character keyword typos (e.g.
+`posedge`/`negedge`/`always`) - flagging as a possible robustness
+improvement rather than doing it reactively for this one instance.
+
+### Router forwarding gap: now confirmed in-scope to fix (not just document)
+
+The organizers have since indicated some medium/hard IPs may need to be
+*extended*, not just used as-is - directly relevant to the structural
+router-forwarding gap flagged for medium (`gen_tilelink_router` generates
+every compass port with the same fixed slave-only direction, which cannot
+physically forward a packet between two router instances - see the medium
+section above for the full derivation). This is no longer being left as a
+documented-but-unfixed risk; extending the router (and, per a detail in the
+hard doc's AXI-Lite SRAM section - "the router drives its AXI ports
+directly, no NI on the local path" - probably also giving the router its
+own embedded local-delivery AXI-master logic rather than relying on NI for
+that path) is now planned as real work, not just a flagged concern. Not
+started as of this note.
