@@ -81,3 +81,37 @@ regardless of RTL quality. Local runs can only confirm that generation
 completes and produces a plausible file set - real scoring only happens at
 organizer judging time. See `README.md` for the recommended local smoke-test
 procedure.
+
+## Re-verification after the ASU token-normalized scoring update (2026-07-26)
+
+The organizers pushed updates to `ICLAD26-ASU-Problems`, `ICLAD26-NVIDIA-Problems`,
+and `ICLAD26-NXP-Problems` on 2026-07-25/26 (the NXP one: "Updated architecture
+document", a docs-only change to `problems/hard/docs/architecture.html` - no
+functional/testcase changes for the `easy` problem this agent targets). Pulled
+`ICLAD26-NXP-Problems` to the latest commit and re-ran this exact agent
+end-to-end against it (`run_benchmark.py --problem easy`, real
+`gemini-2.5-flash` calls through the local `model_service.py` proxy, run-id
+`t19_verify_20260726`):
+
+- **Generation completeness**: all 9 expected files generated (8 IP `.v`
+  files + `secure_periph_soc.v`), matching every prior successful run.
+- **Golden TB check**: `Golden TB not found` - expected, not a failure (see
+  "Known local-testing limitation" above).
+- **Syntactic validity and elaboration** (the deeper check the README
+  recommends but which needs `iverilog`/`vvp`, previously not confirmed in
+  this exact environment): `iverilog -g2005 -o smoke_test -s
+  secure_periph_soc *.v` compiled cleanly, exit code 0, real output binary
+  produced. `iverilog` wasn't installed system-wide here and this
+  environment doesn't have root/sudo access; it was obtained without root
+  via `apt-get download iverilog` (no root required, unlike `apt-get
+  install`) followed by `dpkg-deb -x` to extract it locally. The extracted
+  binary looks for its codegen backend (`ivl`/`ivlpp`) at a hardcoded system
+  path by default, which doesn't exist without a real install - iverilog's
+  own `-B <path>` flag redirects it to the extracted copy's
+  `usr/lib/x86_64-linux-gnu/ivl/` directory instead, avoiding the need for
+  root entirely. Useful to know for reproducing this check in any similarly
+  locked-down environment.
+
+Both checks passing confirms the submission still works correctly against
+the organizers' latest problem-repo revision, not just the version it was
+originally developed against.
