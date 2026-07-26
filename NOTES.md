@@ -356,11 +356,36 @@ mechanism that was structurally impossible before. This is the single most
 important verification in this NXP track's work so far, since it's real
 simulated behavior, not elaboration or generation completeness.
 
+**2-hop (X-then-Y) forwarding verified (2026-07-26)**: extended to a
+THREE-router chain matching the doc's own worked example - A (0,0)
+--East/West-- B (1,0) --North/South-- C (1,1), a *separate* physical link
+pair from the A<->B one, on B's North port. B here is a genuine
+pass-through/intermediate hop: it must re-forward a packet it did not
+originate, using its own `dest_sel` routing decision a second time. A
+real SRAM model sits behind C this time (B's own SRAM is stubbed/idle,
+since the packet only transits B). Test (`tb_router_2hop.v`): WRITE
+injected at A destined for (1,1) (`addr[31:28]=1,addr[27:24]=1`). At A:
+`dest_x(1) > NODE_X(0)` -> east. At B: `dest_x(1)==NODE_X(1)` and
+`dest_y(1) > NODE_Y(0)` -> north. At C: both equal -> local delivery.
+Result, **passed on the first real run** (only cosmetic port-width
+padding warnings on unused tie-off nets, not a functional issue):
+```
+[125000] C's SRAM received WRITE: addr=4 data=feedface0badc0de
+[PASS] 2-hop (East then North) forward WORKED: C's memory[4] = feedface0badc0de
+[PASS] Write-ack D-channel response returned all the way to A's local port.
+SCORE: 1/1
+```
+This is a materially stronger result than the 1-hop test: it confirms the
+`dest_sel`/`origin`/arbitration logic composes correctly when a router is
+acting purely as a relay (neither the packet's source nor its
+destination), which is the actual common case in a real multi-node mesh.
+New file: `agent/rtl_gen_lib_ext/tb_router_2hop.v`. `gen_router_v2.py`'s
+`__main__` block extended to also emit a third instance (`u_router_c` at
+(1,1)) for this test.
+
 **Not yet done**: wiring this corrected router into the actual agent
 pipeline (replacing the `rtl_gen_lib` call for `ip_type: tilelink_router`
-with this generator), a 2-hop test (X-then-Y direction, matching the
-architecture docs' own worked examples) to confirm chained forwarding
-through a third router, and read-transaction testing (the docs note reads
+with this generator), and read-transaction testing (the docs note reads
 to remote nodes are a known limitation even in the reference design, so
 this may not need full support - see medium/hard doc callouts on the
 D-channel limitation).

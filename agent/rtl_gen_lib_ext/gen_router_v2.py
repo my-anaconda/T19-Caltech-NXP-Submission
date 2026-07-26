@@ -296,7 +296,7 @@ endmodule
 
 
 if __name__ == "__main__":
-    for name, x, y in [("u_router_a", 0, 0), ("u_router_b", 1, 0)]:
+    for name, x, y in [("u_router_a", 0, 0), ("u_router_b", 1, 0), ("u_router_c", 1, 1)]:
         spec = {"name": name, "node_x": x, "node_y": y, "data_width": 64, "addr_width": 32}
         files = gen_tilelink_router_v2(spec)
         for fname, content in files.items():
