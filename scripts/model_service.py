@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-T19 NXP ICLAD 2026 — Local Vertex AI Express Mode model service
+T19 NXP ICLAD 2026 — Local Gemini Developer API model service
 ==================================================================
 Implements the exact model_endpoint HTTP contract described in the official
 AGENT_GUIDE.md (POST /generate, GET /health) so the agent in
@@ -53,8 +53,20 @@ if _env_file.exists():
 
 
 class GeminiVertexWrapper:
-    """Vertex AI Express Mode wrapper - same pattern as
-    T19-Caltech-NVIDIA-Submission/src/agent.py's GeminiVertexWrapper."""
+    """Gemini API client wrapper - same pattern as
+    T19-Caltech-NVIDIA-Submission/src/agent.py's GeminiVertexWrapper.
+
+    Uses the plain Gemini Developer API (vertexai=False), not Vertex AI
+    Express Mode: the AI Studio key issued from the frictionless GCP account
+    (billing enabled, higher quota than the old free-tier Express Mode key)
+    returns 403 API_KEY_SERVICE_BLOCKED on aiplatform.googleapis.com when
+    vertexai=True is set - verified directly against the live API. Plain
+    Gemini Developer API mode works with this key; confirmed models
+    include gemini-3.5-flash (supports thinking_config/thinking_budget=0),
+    gemini-3.5-flash-lite, gemini-flash-latest, gemini-pro-latest. The old
+    "gemini-2.5-flash" / "gemini-2.0-flash-exp" names return 404 "no longer
+    available to new users" on this key - use gemini-3.5-flash instead.
+    """
 
     def __init__(self):
         self.api_key = os.environ.get("EXPRESS_MODE_KEY")
@@ -62,11 +74,7 @@ class GeminiVertexWrapper:
             print("[WARN] EXPRESS_MODE_KEY environment variable not set.", file=sys.stderr)
         if genai is None:
             raise RuntimeError("google-genai is not installed. Run: pip install google-genai")
-        self.client = genai.Client(
-            vertexai=True,
-            api_key=self.api_key,
-            http_options={"headers": {"X-Goog-User-Project": ""}},
-        )
+        self.client = genai.Client(api_key=self.api_key)
 
     def generate(self, model, prompt, max_output_tokens=8192):
         # Gemini 2.5's internal "thinking" step draws from the SAME token

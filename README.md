@@ -12,7 +12,7 @@ T19-Caltech-NXP-Submission/
 ├── agent/
 │   └── t19_nxp_agent_final.py   ← the submission agent
 ├── scripts/
-│   └── model_service.py         ← local Vertex AI Express Mode proxy, for testing
+│   └── model_service.py         ← local Gemini Developer API proxy, for testing
 ├── requirements.txt
 ├── NOTES.md                     ← design rationale / version comparison
 └── README.md                    ← this file
@@ -33,10 +33,15 @@ T19-Caltech-NXP-Submission/
 1. Python 3.8+, `iverilog`/`vvp` 10.0+ (see that repo's `DEPENDENCIES.md`).
 2. `pip install -r requirements.txt` (just `google-genai`, needed by
    `scripts/model_service.py`).
-3. A Vertex AI Express Mode API key:
+3. A Gemini API key (from [ai.studio](https://ai.studio) - the frictionless
+   GCP hackathon account gives a billing-enabled project with much higher
+   quota than the free-tier Vertex AI Express Mode this used previously):
    ```bash
    export EXPRESS_MODE_KEY="your_actual_api_key_here"
    ```
+   (The env var name `EXPRESS_MODE_KEY` is kept for compatibility with
+   existing scripts, but `model_service.py`'s client now runs in plain
+   Gemini Developer API mode, not Vertex AI Express Mode - see below.)
 
 ## Running
 
@@ -56,15 +61,19 @@ cd <path-to>/ICLAD26-NXP-Problems
 python3 runner/run_benchmark.py \
     --problem easy \
     --agent <path-to>/T19-Caltech-NXP-Submission/agent/t19_nxp_agent_final.py \
-    --model gemini-2.5-flash \
+    --model gemini-3.5-flash \
     --model-endpoint http://127.0.0.1:8080 \
     --run-id t19_final_v1
 ```
 
-Note: `gemini-2.0-flash-exp` (the default baked into `run_benchmark.py`/
-`AGENT_GUIDE.md`'s examples) returned 404s from Vertex AI during development -
-it appears to be a retired experimental model name. Use a current model
-(`gemini-2.5-flash` verified working) via `--model` as shown above.
+Note: model name depends on which key is behind `EXPRESS_MODE_KEY`. With a
+Gemini API key from a new/frictionless-hackathon GCP project (billing
+enabled, higher quota - see `NOTES.md`), older names like `gemini-2.5-flash`
+and `gemini-2.0-flash-exp` (the default baked into `run_benchmark.py`/
+`AGENT_GUIDE.md`'s examples) return 404 "no longer available to new users" -
+`gemini-3.5-flash` is confirmed working and is the only current-generation
+name that still honors `thinking_config`/`thinking_budget=0`. Use whichever
+model name is actually enabled for your key via `--model` as shown above.
 
 This writes generated RTL to `ICLAD26-NXP-Problems/result/t19_final_v1/easy/`
 and (since `--skip-eval` isn't passed) immediately runs the evaluator too.
@@ -107,15 +116,19 @@ submission:
 Real correctness/efficiency scoring only happens against the hidden golden
 testbench at organizer judging time.
 
-## Gemini 2.5 "thinking" gotcha (already handled in `scripts/model_service.py`)
+## Gemini "thinking" gotcha (already handled in `scripts/model_service.py`)
 
-Gemini 2.5 models spend part of `max_output_tokens` on an internal "thinking"
-step before producing visible text. With a modest token budget, thinking
-alone can exhaust it - `finish_reason` comes back `MAX_TOKENS` with only a
-truncated fragment of real output (hit and fixed during development).
-`model_service.py` sets `thinking_config=ThinkingConfig(thinking_budget=0)` to
-disable this for this structured-generation task, which is also cheaper and
-faster. Keep this in mind if you swap in a different model server/config.
+Gemini 2.5 and 3.5 models (confirmed on both) spend part of `max_output_tokens`
+on an internal "thinking" step before producing visible text. With a modest
+token budget, thinking alone can exhaust it - `finish_reason` comes back
+`MAX_TOKENS` with only a truncated fragment of real output (hit and fixed
+during development). `model_service.py` sets
+`thinking_config=ThinkingConfig(thinking_budget=0)` to disable this for this
+structured-generation task, which is also cheaper and faster. Note: not every
+model name honors this - "lite"/"latest"-alias model names
+(`gemini-3.5-flash-lite`, `gemini-flash-latest`, etc.) rejected the explicit
+`thinking_config` outright with a 400 error during testing; `gemini-3.5-flash`
+accepts it. Keep this in mind if you swap in a different model server/config.
 
 ## What's different from the starter/reference agents
 
