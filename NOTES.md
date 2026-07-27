@@ -1140,3 +1140,204 @@ this on any run where Step 4 writes it this way, regardless of which IP
 category is under test. Worked around here by patching a throwaway copy
 (`assign perf_cntN = 32'h0;`) purely to unblock verifying this session's
 own fixes; the real fix belongs to the `perf_counter` pass.
+
+## `perf_counter` category (T801-T807/T805a/T805b/T804a/T804b - 9 checks) - a
+## real doc-vs-generator counting bug, plus the top-level bug flagged above
+
+Fixed both real bugs found for `u_perf` in this pass.
+
+**Bug #1 (flagged above, fixed here): the top-level's `u_perf.u_cntN.count`
+hierarchical reference.** Confirmed the real register names in BOTH
+`gen_perf_counter` (organizer's) and the new `gen_perf_counter_v2.py`
+are flat `cnt0`..`cnt3` inside the module itself - no `u_cntN` sub-module
+wrapper exists in either. Since that flat name is hardcoded (never
+LLM-inferred) in both generator versions, the substitution is always
+safe and deterministic - fixed with `fix_perf_counter_hier_ref()`,
+regex-substituting `u_perf.u_cntN.count` -> `u_perf.cntN` on the Step-4
+top-level text, same philosophy as the crossbar S0 window and AHB bridge
+hprot fixes.
+
+**Bug #2, found by reading `gen_perf_counter` before writing any
+testbench code.** The architecture doc is explicit: *"A perf_counter
+with 4 event channels, each counting POSITIVE EDGES of its event
+input."* But the generator's increment logic is a plain level check -
+`if(event_i) cnt_i<=cnt_i+1;` - incrementing every cycle `event_i`
+happens to be held high, not once per rising edge. This isn't
+theoretical: two of the four documented channel wirings are genuinely
+multi-cycle/level signals, not 1-cycle pulses - ch[0] is `ni_00`'s
+`tl_a_valid` (can stay asserted across a stalled multi-cycle NoC
+transaction) and ch[1]/ch[2] are `dma0_irq`/`dma1_irq` (level IRQs that
+stay high until explicitly cleared/re-armed, per the DMA engine's own
+documented STATUS/IRQSTAT semantics) - the original generator would
+silently over-count by however many extra cycles the source stayed
+high. (ch[3], the OR of the AES engines' 1-cycle `done` pulses, happens
+to be safe either way - likely why this was never caught against a
+1-cycle-pulse-only test.) T802 is the direct test: hold `event_0` high
+for 5 consecutive cycles and check `cnt0` increments by exactly 1, not
+5. Confirmed empirically against the unpatched original generator (T802
+failed in isolation, every other test passed) before writing any fix.
+Fixed in `gen_perf_counter_v2.py` with a proper per-channel rising-edge
+detector - the exact same `prev`-register-and-AND-with-inverted-prev
+pattern already proven correct in `gen_irq_aggregator`'s own `edge_ev`.
+
+`tb_hard_perf_counter.v` uses the same force/release-on-the-IP's-own-
+ports approach as `irq_crypto` (`event_0..3`, and the plain always-ready
+APB slave interface) - the doc's own CPU-visible address for these
+counters (`0xF001_0008..0x14` via SoC config regs) is real, but the
+top-level's actual wiring to get there varies a lot per run (confirmed:
+one real generation captures `PERF_CTRL`'s enable/clear-all bits into a
+register that's then never read by anything else - a dangling register,
+found by reading the source, not fixed here since it's a top-level
+integration gap rather than a generator bug, tracked like the DMA-config
+-bus gap).
+
+**Two testbench-only timing issues found and fixed along the way (real
+DUT behavior, just not what my first draft assumed):**
+- Changing a forced stimulus signal (`event_N`) immediately after
+  `@(posedge clk)` races against that SAME edge's own active-region
+  convergence in the DUT (a classic same-edge hazard - nothing to do
+  with the edge-detector logic itself, which is otherwise correct).
+  Confirmed via a real trace: `edge_0` transiently pulsed to 1 then
+  immediately back to 0 within the same simulation timestamp, and
+  whether the counter's own always block "caught" the transient
+  depended on essentially arbitrary scheduling luck. Fixed by always
+  changing `event_N` right after `@(negedge clk)` instead, giving a
+  full half-period of guaranteed settling margin before the next
+  sampling edge.
+- Also needed a known-0 baseline: the real top-level's own drivers for
+  these ports (e.g. `event_0 = s0_arvalid && s0_arready`, real NoC
+  activity) can already be high during reset settling, latching
+  `ev_prevN` to 1 before the testbench ever takes over via force - so
+  the very first forced transition wasn't seen as a rising edge relative
+  to that stale baseline. Fixed by forcing all four to 0 and holding a
+  couple of cycles before any real test stimulus begins.
+- The register-interface clear-all write (`perf_reg_write`, paddr==0)
+  needed to be held across two clock edges to reliably register, not
+  just one - confirmed via trace that all four handshake signals were
+  correctly asserted and stable through a single edge, yet the clear
+  didn't take; a second held edge consistently did. Not fully
+  root-caused beyond that empirical fix, but matches the same "one more
+  settling cycle" pattern already needed for `apb_periph`'s real AHB
+  bridge.
+
+Tests: T801 a single pulse increments by exactly 1; **T802 the key
+level-vs-edge test**; T803 three separate pulses on a second channel
+give exactly 3; T804 channel independence (untouched channels stay 0);
+T805 a write to `paddr==0` clears all four counters at once, even ones
+that were incremented; T806 counting correctly resumes from 0 after a
+clear; T807 the AES-done-sourced channel (genuinely 1-cycle pulses, per
+the doc) also counts correctly.
+
+**Verification took three fresh-regeneration attempts, honestly recorded:**
+- `t19_hard_test12`: hit unrelated Step-4 generation flakiness (duplicate
+  wire declarations + a syntax error in `crypto_soc.v`, nothing to do
+  with any fix from this session) - failed to elaborate at all, discarded.
+- `t19_hard_test13`: elaborated and ran cleanly, confirming the
+  hierarchical-reference bug found in `test11` simply didn't recur this
+  run (Step 4 didn't reference `u_perf` internals at all this time - the
+  `fix_perf_counter_hier_ref()` fix is conditional and only fires if the
+  pattern appears, so this is expected, not a gap) - but it surfaced a
+  **new, genuine bug** in `apb_periph`'s T603 (GPIO0 IN readback):
+  `cpu_rvalid` pulsed for exactly one cycle, several cycles after
+  `cpu_arready` (not fused with it, unlike prior runs), carrying a STALE
+  value left over from an earlier transaction rather than the real
+  target register - confirmed as a genuine top-level read-data-latching
+  bug in that run's own hand-rolled bridge glue (re-tried with an
+  actively-`while(!cpu_rvalid)`-waiting read, the textbook-correct
+  AXI4-Lite pattern already used by the shared `axi_read` task, and it
+  captured the exact same stale value - ruling out a testbench-side
+  race). This is run-dependent top-level flakiness, not something a
+  generator-level `_v2` fix or a generic testbench change can paper over
+  - flagged here, not fixed, tracked like the DMA-config-bus gap.
+  `apb_periph`'s `apb_read` task was left as its original, empirically-
+  reliable fixed-cycle wait (the approach that verified cleanly across
+  `test9`/`test10`/`test11`) rather than "fixed" into something that,
+  when tried, regressed a previously-passing run without fixing this one.
+- `t19_hard_test14` (see below): a completely clean run, used for the
+  real, final full-suite confirmation.
+
+**Verified end-to-end on a fully clean fresh regeneration (`t19_hard_test14`,
+all fixes from this session wired in from the start, no flakiness of any
+kind)**: all eight categories together via `run_suite.sh` - `reset_sync`
+(5/5), `noc_local` (6/6), `noc_routing` (10/10), `aes_basic` (8/8),
+`dma_basic` (10/10), `apb_periph` (6/6), `irq_crypto` (10/10),
+`perf_counter` (9/9) - **64/64 passing**, zero manual RTL edits.
+
+## `irq_periph` category (T901-T907) - a real integration test, no new RTL bug,
+## three testbench lessons
+
+`u_irq_periph` is the SAME `gen_irq_aggregator`/`gen_irq_aggregator_v2.py`
+generator already fixed for `u_irq_crypto` - so there's no new generator
+bug to find here. What makes this category worth its own testbench is
+that irq_periph's five sources - `uart_rx_irq`/`gpio0_irq`/`gpio1_irq`/
+`timer0_irq`/`wdt_irq` - are all REAL APB peripherals already given
+solid, real-CPU-path testbenches in `apb_periph`. So instead of
+force/release-ing the aggregator's own ports in isolation (irq_crypto's
+approach, necessary there since AES/DMA don't have a reliable CPU-facing
+path), `tb_hard_irq_periph.v` triggers each peripheral's OWN real
+interrupt condition via genuine `apb_write` register writes and checks
+the result reaches `cpu_periph_irq`/`cpu_periph_irq_id` - a real,
+end-to-end integration test spanning peripheral -> `irq_periph_src` ->
+aggregator, re-confirming the doc's lowest-id priority contract (T905)
+through the actual integration path, not just the isolated aggregator
+already proven in `tb_hard_irq_crypto.v` T702.
+
+**Three real things found while building this, all testbench-side (no
+RTL fix needed):**
+- Clearing a source peripheral's own status register (e.g. GPIO's
+  `ISTAT`) drops that source's wire into the aggregator, but does NOT
+  clear the AGGREGATOR's own separately-latched `r_pend` bit for it -
+  the exact same lesson already learned in `tb_hard_irq_crypto.v`'s
+  T704/`irq_crypto_clear`, just easy to forget when the *source* being
+  tested is a real peripheral instead of a forced signal. Confirmed via
+  a real trace: GPIO1's own IRQ logic fired correctly, but
+  `cpu_periph_irq_id` still read back GPIO0's id (1) from the PRIOR
+  test, because the aggregator's own pend bit for src[1] was never
+  independently cleared. Fixed by adding `irq_periph_clear_pend`
+  (force/release on `u_irq_periph`'s own register port, same as
+  `tb_hard_irq_crypto.v` - its CPU-visible address is just as
+  unreliable/run-dependent as `u_irq_crypto`'s) after every test.
+- The watchdog's CTRL register (`0x00C`) writes `en`/`wen`/`ren`/`ien`
+  TOGETHER from the same `pwdata`, not just the bit(s) named in a
+  comment - writing `CTRL: en=1` with only bit0 set silently zeroed
+  `ien` (bit3) from its documented reset default of 1, gating
+  `wdt_irq = iq1 & ien` off even though the real stage-1 countdown and
+  `iq1` itself fired exactly on schedule (confirmed via a direct
+  hierarchical trace: `iq1=1`, `ien=0`). Fixed by writing `0x9`
+  (`en=1, ien=1`) instead of `0x1`.
+- The UART's own real status-driven IRQ (`irq_en` enabling the
+  already-true `tx_empty` status bit) needed more settling time before
+  checking the aggregator's output than the other four sources did - a
+  real trace showed the UART's own `irq`/`irq_en`/`irq_stat` all
+  correct at the original check point, but the aggregator's `r_pend`
+  hadn't caught up yet. Fixed by widening the settling window after
+  that one write.
+
+Tests: T901/T902 real rising-edge GPIO0/GPIO1 interrupts (`IPOL`/
+`IEDGE`/`IEN`, then a genuine forced pad edge) resolve to id 1/2; T903 a
+real timer0 counter-wrap interrupt resolves to id 3; T904 a real
+watchdog stage-1 interrupt resolves to id 4; **T905 re-confirms the
+lowest-id priority contract** with two real peripheral sources (GPIO0
+and timer0) pending simultaneously through the full integration path;
+T906 the UART's own status-driven interrupt resolves to id 0; T907 clean
+idle once everything is cleared and disabled.
+
+**Verified end-to-end**: all nine categories together via `run_suite.sh`
+against both `t19_hard_test14` (a completely clean fresh regeneration)
+and `test11_verify` (an earlier, independently-verified copy) -
+`reset_sync` (5/5), `noc_local` (6/6), `noc_routing` (10/10), `aes_basic`
+(8/8), `dma_basic` (10/10), `apb_periph` (6/6), `irq_crypto` (10/10),
+`perf_counter` (9/9), `irq_periph` (7/7) - **71/71 passing** on both, no
+RTL fix needed for this category (testbench-only lessons, no generator
+or top-level change).
+
+**Also newly found while building this (flagged, not fixed - a
+top-level-bridge-timing issue, same class as the `test13` finding
+above)**: on `t19_hard_test13` specifically, `apb_periph`'s T603 (GPIO0
+IN readback) failed - `cpu_rvalid` pulsed once, several cycles after
+`cpu_arready` and not fused with it, carrying a stale value from an
+earlier transaction rather than the real target register. Re-verified
+this is a genuine top-level bug (not a testbench race) by trying an
+actively-`while(!cpu_rvalid)`-waiting read, which captured the identical
+stale value. Both `t19_hard_test11`/`test14` show no such issue -
+run-dependent Step-4 top-level flakiness, tracked but not blocking.

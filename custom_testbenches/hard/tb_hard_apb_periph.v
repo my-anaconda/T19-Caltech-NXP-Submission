@@ -127,6 +127,33 @@ module tb_hard_apb_periph;
     // cycle (reads are idempotent - a repeat read of the same address
     // just returns the same correct value), so this simply waits several
     // cycles past acceptance before trusting cpu_rdata.
+    // Same fused-ack issue as apb_write, but on the read side: cpu_rvalid
+    // pulses the SAME cycle as cpu_arready (fused with the bridge's IDLE
+    // accept), well before the bridge's real ST_ENABLE phase captures
+    // prdata into its hrdata register - confirmed via a real trace
+    // showing rdata still holding a STALE previous value at the moment
+    // rvalid first pulses. Unlike writes, holding arvalid a few EXTRA
+    // cycles here is safe even if it re-triggers a second internal read
+    // cycle (reads are idempotent - a repeat read of the same address
+    // just returns the same correct value), so this simply waits several
+    // cycles past acceptance before trusting cpu_rdata.
+    //
+    // NOTE (flagged, not fixed - see NOTES.md): a later regeneration
+    // (t19_hard_test13) showed a DIFFERENT and worse failure mode on
+    // this same read path - cpu_rvalid pulsing several cycles AFTER
+    // arready (not fused with it), for exactly one cycle, carrying a
+    // STALE value left over from an earlier transaction (not this run's
+    // real target register) even at the moment rvalid is asserted. That
+    // is a genuine top-level read-data-latching bug in that specific
+    // run's hand-rolled bridge glue, not a testbench timing issue - an
+    // actively-waiting `while(!cpu_rvalid)` capture (the textbook-correct
+    // AXI4-Lite pattern, and what the shared axi_read task already does)
+    // captured the SAME stale value, ruling out a BFM-side race. Left as
+    // the simpler, empirically-reliable fixed-cycle wait here since that
+    // approach is what verified successfully across three separate
+    // regenerations (t19_hard_test9/10/11) - this is a known, run-
+    // dependent gap, not something a testbench-only change can paper
+    // over generically.
     task apb_read;
         input [31:0] addr;
         output [31:0] data;

@@ -580,11 +580,38 @@ def fix_ahb_bridge_hprot(top_level_verilog):
     return fixed
 
 
+def fix_perf_counter_hier_ref(top_level_verilog):
+    """Correct a real Step-4 top-level bug: a real generation
+    (t19_hard_test11) referenced `u_perf.u_cnt0.count` (and .u_cnt1/2/3)
+    - a hierarchical cross-module reference assuming the perf_counter
+    instance internally wraps each counter in its own sub-module (u_cntN)
+    with a register named `count`. Neither gen_perf_counter nor
+    gen_perf_counter_v2 do that - both declare flat registers named
+    `cnt0`..`cnt3` directly inside the perf_counter module itself.
+    iverilog fails elaboration outright on this ("Unable to bind
+    wire/reg/memory `u_perf.u_cnt0.count`"), blocking every category's
+    testbench on any run where Step 4 writes it this way - not just
+    perf_counter's own tests. Since `cntN` is always the exact, guaranteed
+    real register name (it's hardcoded in both generator versions, never
+    LLM-inferred), this substitution is always safe and deterministic -
+    same "don't depend on the LLM guessing it right every time"
+    philosophy as the crossbar S0 window and AHB bridge hprot fixes.
+    """
+    fixed, n = re.subn(r'u_perf\.u_cnt(\d+)\.count', r'u_perf.cnt\1', top_level_verilog)
+    if n:
+        print(f"[FIX] Top-level: corrected {n} broken u_perf.u_cntN.count "
+              f"hierarchical reference(s) to u_perf.cntN (the real flat "
+              f"register name) - the sub-module wrapper the LLM assumed "
+              f"doesn't exist in either perf_counter generator.",
+              file=sys.stderr)
+    return fixed
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric", "irq_aggregator"):
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric", "irq_aggregator", "perf_counter"):
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -613,6 +640,9 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
         elif spec["ip_type"] == "irq_aggregator":
             from gen_irq_aggregator_v2 import gen_irq_aggregator_v2
             files = gen_irq_aggregator_v2(spec)
+        elif spec["ip_type"] == "perf_counter":
+            from gen_perf_counter_v2 import gen_perf_counter_v2
+            files = gen_perf_counter_v2(spec)
         else:
             from gen_aes_v2 import gen_aes128_v2
             files = gen_aes128_v2(spec)
@@ -852,6 +882,8 @@ Do not include long explanations outside the code block.
         sys.exit(1)
     if ".hprot(" in top_level_verilog:
         top_level_verilog = fix_ahb_bridge_hprot(top_level_verilog)
+    if "u_cnt" in top_level_verilog:
+        top_level_verilog = fix_perf_counter_hier_ref(top_level_verilog)
     if "endmodule" not in top_level_verilog:
         # No closing fence AND no endmodule = the response was truncated
         # mid-file (hit max_output_tokens before finishing), not just missing
