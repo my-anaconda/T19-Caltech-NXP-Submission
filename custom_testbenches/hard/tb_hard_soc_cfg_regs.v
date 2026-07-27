@@ -45,21 +45,34 @@
 //   1'b1 (never actually resetting) on one regeneration, leaving every
 //   read-side register permanently 'x' - a direct violation of the
 //   doc's own "wr_rst_n and rd_rst_n both = sys_rst_n".
-// - fix_perf_paddr_rebase(): PERF_CNT0..3 reads (SoC offsets 0x08..14)
-//   were wired to u_perf for real, but the address was passed straight
-//   through unrebased - u_perf's OWN internal register convention
-//   always starts at paddr=0 regardless of where it's mapped into the
-//   larger SoC space, so reading the documented PERF_CNT0 offset (0x08)
-//   actually landed on u_perf's cnt2. Confirmed on TWO independent
-//   regenerations even with prompt guidance already warning about it in
-//   general terms - the fix completely replaces u_perf's .paddr(...)
-//   connection with a fresh, correctly-rebased expression built
-//   directly from the crossbar's own guaranteed s2_awaddr/s2_araddr
-//   signal names. Has a safety guard: only applies when u_perf's own
-//   paddr expression genuinely traces back to an s2_ signal - a
-//   DIFFERENT regeneration (test14) reaches u_perf through a completely
-//   unrelated S1/APB-fabric slot instead, and blindly rebasing there
-//   would have broken a currently-working, unrelated addressing path.
+// - fix_perf_paddr_rebase(): fixes BOTH PERF_CNT0..3 addressing AND
+//   PERF_CTRL's clear-all bit, together (originally two separate
+//   findings, folded into one fix once the second turned out to share
+//   the same root cause and the same safe fix point). PERF_CNT0..3
+//   reads (SoC offsets 0x08..14) were wired to u_perf for real, but the
+//   address was passed straight through unrebased - u_perf's OWN
+//   internal register convention always starts at paddr=0 regardless of
+//   where it's mapped into the larger SoC space, so reading the
+//   documented PERF_CNT0 offset (0x08) actually landed on u_perf's
+//   cnt2. PERF_CTRL (0x18)'s clear-all bit has a DIFFERENT problem:
+//   it isn't one of u_perf's own four counter registers at a rebased
+//   offset at all - naively rebasing it the same way (0x18-0x08=0x10)
+//   lands on a paddr u_perf doesn't recognize as anything, not even its
+//   own paddr=0 clear-all trigger, so nothing happens. Both confirmed
+//   on multiple independent regenerations even with prompt guidance
+//   already warning about them in general terms - fixed by completely
+//   replacing u_perf's .psel/.penable/.pwrite/.paddr connections
+//   (never touching .pwdata - the clear-all trigger doesn't care about
+//   its value) with a fresh, self-contained set of wires built directly
+//   from the crossbar's own guaranteed s2_awaddr/s2_araddr/s2_awvalid/
+//   s2_wdata signal names - PERF_CTRL writes with bit1 set are
+//   specifically redirected to paddr=0. Has a safety guard: only
+//   applies when u_perf's own paddr expression genuinely traces back to
+//   an s2_ signal - a DIFFERENT regeneration (test14) reaches u_perf
+//   through a completely unrelated S1/APB-fabric slot instead, and
+//   blindly rewiring there would have broken a currently-working,
+//   unrelated addressing path (verified this guard leaves test14
+//   untouched while still fixing every S2-routed regeneration tested).
 // - The S2 read-response state machine getting its internal rvalid
 //   register PERMANENTLY STUCK at 1 after the first read (confirmed
 //   recurring on two more regenerations) is NOT fixed with a regex -
@@ -67,19 +80,9 @@
 //   clear-condition logic is too entangled in each run's own internal
 //   FSM to safely rewrite in isolation. Prompt guidance alone (point 3
 //   of SOC_CFG_WIRING_NOTE) has been observed getting this right on
-//   more recent regenerations, but isn't guaranteed the way the three
-//   deterministic fixes above are.
-//
-// PERF_CTRL (0x18)'s clear-all functionality remains a confirmed,
-// NOT-deterministically-fixed gap: unlike PERF_CNT0..3, it isn't simply
-// one of u_perf's own four counter registers at a rebased offset - it's
-// a distinct SoC-level concept (a specific control bit) that needs to be
-// TRANSLATED into a dedicated write to u_perf's own paddr=0. Synthesizing
-// that safely, without risking a conflict with whatever the LLM's own
-// PERF_CNT read/write wiring is already doing on the SAME psel/paddr
-// port bundle, was judged too risky for a generic regex fix - prompt
-// guidance (point 4) has gotten it right on at least one regeneration,
-// but is not guaranteed.
+//   more recent regenerations, but isn't guaranteed the way the
+//   deterministic fixes above are - the one remaining gap this category
+//   is not immune to.
 module tb_hard_soc_cfg_regs;
     reg clk = 0, dsp_clk = 0, por_n;
     always #5 clk = ~clk;

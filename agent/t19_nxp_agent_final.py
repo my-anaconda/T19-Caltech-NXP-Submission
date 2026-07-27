@@ -758,31 +758,49 @@ def fix_mbox_rd_rst_n(top_level_verilog):
 
 
 def fix_perf_paddr_rebase(top_level_verilog):
-    """Correct a real Step-4 top-level bug, confirmed on two independent
-    regenerations (t19_hard_test19/test20) even AFTER adding explicit
-    prompt guidance about it (SOC_CFG_WIRING_NOTE point 4): `u_perf`'s
-    `paddr` port gets driven with the SoC config space's raw address
-    offset passed straight through (e.g. `{4'h0, s2_awaddr[7:0]}`), with
-    no rebasing. But `u_perf`'s own internal register convention is
-    FIXED and independent of wherever it's mapped into the larger SoC
-    address space - its own paddr=0/4/8/12 read cnt0/cnt1/cnt2/cnt3
-    respectively, always starting from 0. The architecture doc maps
-    PERF_CNT0 to SoC config offset 0x08 (not 0x00), so a raw pass-
-    through reads/writes the WRONG counter (confirmed directly: forcing
-    a real event pulse to make cnt0=1, then reading the documented
-    PERF_CNT0 SoC offset, returned 0 - because the unrebased address
-    landed on u_perf's own cnt2 instead).
+    """Correct two real Step-4 top-level bugs around `u_perf`'s SoC
+    config-space wiring, confirmed across multiple independent
+    regenerations even AFTER adding explicit prompt guidance about them
+    (SOC_CFG_WIRING_NOTE point 4).
 
-    Unlike the mailbox fixes, this is NOT fixed by wrapping u_perf's
-    `psel`/`penable`/`pwrite` (both observed regenerations already
-    computed those correctly) - only `paddr` needs correcting, and only
-    by a fixed, doc-derived constant offset (0x08), not something that
-    varies per run. Completely replaces `u_perf`'s `.paddr(...)`
-    connection with a fresh expression computed directly from the
-    crossbar's own guaranteed, non-inferred S2 port names
-    (`s2_awaddr`/`s2_araddr`/`s2_awvalid`), rather than trying to parse
-    and rebase whatever intermediate expression the LLM wrote - avoids
-    ever double-subtracting if a future run already gets this right.
+    Bug A - PERF_CNT0..3 addressing (t19_hard_test19/test20/test22):
+    `u_perf`'s `paddr` port gets driven with the SoC config space's raw
+    address offset passed straight through (e.g. `{4'h0,
+    s2_awaddr[7:0]}`), with no rebasing. But `u_perf`'s own internal
+    register convention is FIXED and independent of wherever it's mapped
+    into the larger SoC address space - its own paddr=0/4/8/12 read
+    cnt0/cnt1/cnt2/cnt3 respectively, always starting from 0. The
+    architecture doc maps PERF_CNT0 to SoC config offset 0x08 (not
+    0x00), so a raw pass-through reads/writes the WRONG counter
+    (confirmed directly: forcing a real event pulse to make cnt0=1, then
+    reading the documented PERF_CNT0 SoC offset, returned 0 - because
+    the unrebased address landed on u_perf's own cnt2 instead).
+
+    Bug B - PERF_CTRL's clear-all bit (t19_hard_test19/test20, PERF_CTRL
+    write bit1 documented as "write 1 to clear all counters"):
+    PERF_CTRL (SoC offset 0x18) isn't one of u_perf's own four counter
+    registers at a rebased offset - it's a distinct SoC-level concept.
+    Naively rebasing 0x18 the same way as the counters (0x18 - 0x08 =
+    0x10) lands on a paddr u_perf doesn't recognize as anything - not
+    one of its four counters, and specifically NOT its own paddr=0
+    clear-all trigger (`if (psel&&penable&&pwrite&&paddr==0) begin
+    {clr} end`) - so nothing happens. Confirmed both observed
+    regenerations' own psel-generation logic already covers offset 0x18
+    in its "is this a perf register" range check (it's naturally
+    included alongside the four counters), so psel/penable/pwrite were
+    already asserting correctly for a PERF_CTRL write - only paddr
+    needed to be redirected to 0 specifically for this one case.
+
+    Both fixed together by completely replacing `u_perf`'s
+    `.psel`/`.penable`/`.pwrite`/`.paddr` connections with a fresh,
+    self-contained set of wires computed directly from the crossbar's
+    own guaranteed, non-inferred S2 port names (never touching pwdata -
+    the clear-all trigger doesn't care about its value). Taking full
+    ownership of all four signals (not just paddr) avoids depending on
+    whatever range-check logic the LLM happened to write for psel/
+    pwrite being correct - a DIFFERENT regeneration's own check could in
+    principle use an exclusive upper bound that excludes 0x18 entirely,
+    silently never asserting psel for a PERF_CTRL write at all.
     """
     m = re.search(r'u_perf\b[^;]*\([^;]*?\);', top_level_verilog, re.DOTALL)
     if not m:
@@ -813,19 +831,32 @@ def fix_perf_paddr_rebase(top_level_verilog):
             is_s2_routed = True
     if not is_s2_routed:
         return top_level_verilog
-    FIXED_WIRE = "perf_paddr_rebased"
-    if paddr_m.group(1) == FIXED_WIRE:
+    FIXED_PADDR = "perf_paddr_rebased"
+    if paddr_m.group(1) == FIXED_PADDR:
         return top_level_verilog  # already patched
-    new_block = block[:paddr_m.start()] + f".paddr({FIXED_WIRE})" + block[paddr_m.end():]
+    new_block = block
+    for port, repl in (("psel", "perf_psel_fixed"), ("penable", "perf_penable_fixed"),
+                       ("pwrite", "perf_pwrite_fixed"), ("paddr", FIXED_PADDR)):
+        port_m = re.search(rf'\.{port}\(\s*([^)]+?)\s*\)', new_block)
+        if port_m:
+            new_block = new_block[:port_m.start()] + f".{port}({repl})" + new_block[port_m.end():]
     decl = (
-        f"wire [11:0] {FIXED_WIRE} = "
+        "wire perf_ctrl_clear = s2_awvalid && s2_wvalid && "
+        "(s2_awaddr[7:0] == 8'h18) && s2_wdata[1];\n"
+        "    wire perf_range_hit = (s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]) >= 8'h08 && "
+        "(s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]) <= 8'h18;\n"
+        "    wire perf_psel_fixed = (s2_awvalid || s2_arvalid) && perf_range_hit;\n"
+        "    wire perf_penable_fixed = perf_psel_fixed;\n"
+        "    wire perf_pwrite_fixed = s2_awvalid;\n"
+        f"    wire [11:0] {FIXED_PADDR} = perf_ctrl_clear ? 12'h000 : "
         "{4'h0, (s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]) - 8'h08};\n    "
     )
-    print("[FIX] Top-level: replaced u_perf's paddr connection with a "
-          "freshly-rebased expression (SoC config offset - 0x08) - the "
-          "generated address was passed straight through unrebased, "
-          "landing on the wrong counter (e.g. PERF_CNT0's documented "
-          "offset 0x08 hit u_perf's own cnt2, not cnt0).", file=sys.stderr)
+    print("[FIX] Top-level: replaced u_perf's psel/penable/pwrite/paddr "
+          "connections with a fresh, self-contained set of wires - "
+          "PERF_CNT0..3 reads were passed the raw SoC offset unrebased "
+          "(landing on the wrong counter), and PERF_CTRL's clear-all "
+          "write (bit1) was never redirected to u_perf's own paddr=0 "
+          "clear-all trigger.", file=sys.stderr)
     return top_level_verilog[:m.start()] + decl + new_block + top_level_verilog[m.end():]
 
 

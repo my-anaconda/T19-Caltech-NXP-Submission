@@ -1470,8 +1470,8 @@ all ten categories together via `run_suite.sh` - `reset_sync` (5/5),
 `PERF_CNT`/`PERF_CTRL` checks) - **77/79 passing** consistently across
 all three.
 
-## `soc_cfg_regs` follow-up - PERF_CNT0..3 fixed for real (prompt guidance +
-## a deterministic backstop), PERF_CTRL remains a genuine, deliberate gap
+## `soc_cfg_regs` follow-up - PERF_CNT0..3 AND PERF_CTRL both fixed for real
+## (prompt guidance + a deterministic backstop) - soc_cfg_regs now 8/8
 
 Revisited after `mailbox` was done, prompted directly by the question of
 whether the last 2 failing checks (`T1006`/`T1007`) were fixable at all.
@@ -1520,30 +1520,39 @@ intermediate named wire, by chasing that wire's own declaration
 elsewhere in the file) - verified this guard correctly leaves `test14`
 completely untouched while still fixing `test19`/`test20`.
 
-**PERF_CTRL's clear-all bit (offset `0x18`) remains a genuine, confirmed,
-deliberately-not-fixed gap.** Unlike `PERF_CNT0..3`, it isn't simply one
-of `u_perf`'s own four counter registers at a rebased offset - checked
+**3. Asked directly: "before integration, want to try that PERF_CTRL even
+if risky" - so it got a real attempt, not just a documented gap.**
+`PERF_CTRL`'s clear-all bit (offset `0x18`) isn't simply one of
+`u_perf`'s own four counter registers at a rebased offset - checked
 directly on `test19`: its `is_perf_reg` range check lumps `0x18` in with
-the four counters, so the rebase arithmetic (`0x18 - 0x08 = 0x10`) lands
-on a paddr `u_perf` doesn't recognize as anything (not one of its four
-counters, and specifically NOT its own `paddr=0` clear-all trigger) -
-nothing happens. A correct implementation needs to TRANSLATE a specific
-SoC-level control bit into a dedicated, separate write to `u_perf`'s own
-`paddr=0`, coexisting with (not conflicting with) whatever the same
-run's own `PERF_CNT` read/write wiring is already doing on the exact
-same `psel`/`paddr` port bundle - judged too easy to get subtly wrong
-generically for a safe regex fix. Prompt guidance alone got PERF_CTRL
-right on one of four tested regenerations (`test21`, full `8/8`) - real
-progress, but not a guarantee the way the three deterministic fixes are.
+the four counters, so the naive rebase arithmetic (`0x18 - 0x08 = 0x10`)
+lands on a paddr `u_perf` doesn't recognize as anything (not one of its
+four counters, and specifically NOT its own `paddr=0` clear-all
+trigger) - nothing happens. The key realization that made this
+tractable: `tb_hard_soc_cfg_regs.v`'s own `T1007` only tests the
+clear-all bit, not the (genuinely unimplementable, since `u_perf` has no
+enable register at all) enable bit - and BOTH observed regenerations'
+own `psel`-range check already correctly covered offset `0x18` (`psel`/
+`pwrite` were already asserting correctly for a `PERF_CTRL` write) - the
+ONLY missing piece was redirecting `paddr` to `0` specifically for that
+one case. `fix_perf_paddr_rebase()` was extended (not left as a separate
+function - the two bugs share the same root cause and the same safe fix
+point) to take FULL ownership of `u_perf`'s `.psel`/`.penable`/`.pwrite`/
+`.paddr` connections together (never touching `.pwdata` - the clear-all
+trigger doesn't care about its value), computing all four fresh from the
+crossbar's own S2 signals rather than depending on whichever range-check
+logic the LLM happened to write for `psel` being correct (a different
+regeneration's own check could in principle use an exclusive upper bound
+that silently excludes `0x18` entirely).
 
-**Verified on `test14`/`test19`/`test20` (regression + fix confirmation)
-and a further fresh, fully-automatic regeneration (`test23`, where
-`fix_perf_paddr_rebase()` fired on its own with no manual intervention)**:
-all ten categories together via `run_suite.sh` - everything unchanged
-from before, `soc_cfg_regs` now **7/8** (only `PERF_CTRL` failing,
-`PERF_CNT0..3` now reliably correct) - **90/91 passing**, one full check
-better than the previous best, with the remaining gap now precisely
-understood and honestly documented rather than a vague "not implemented."
+**Verified on `test14` (regression guard - correctly left untouched),
+`test19`/`test20` (both went from `6/8` to full `8/8`), `test21`
+(already `8/8` via prompt guidance alone - confirms zero regression on
+an already-working case), and a further fresh, fully-automatic
+regeneration (`test24`, real agent, no manual intervention)**: all ten
+categories together via `run_suite.sh` - everything else unchanged,
+`soc_cfg_regs` now **8/8**, no known gaps remaining in this category -
+**91/91 passing**, a full clean sweep.
 
 ## `mailbox` category (T1101-T1108, 12 checks) - no generator bug found; a real
 ## testbench bug caught by its own regression suite
