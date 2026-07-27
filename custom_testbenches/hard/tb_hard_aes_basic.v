@@ -197,16 +197,22 @@ module tb_hard_aes_basic;
         run_aes(3, busy_seen, result);
         check(result === CTEXT, "T406");
 
-        // ---- T407: aes3's own done pulse (irq_crypto_src[3]) correctly
-        // aggregates - fire ONLY aes3 (fresh, after clearing any prior
-        // pending state is impossible without a register write, so this
-        // checks id resolves to the HIGHEST pending source: after the
-        // T401/404/405/406 runs above, src[0..3] are all pending, so vid
-        // should be 3, the top of the 4 AES sources) ----
+        // ---- T407: after the T401/404/405/406 runs above, src[0..3]
+        // (aes0..aes3's done pulses) are all pending simultaneously in
+        // u_irq_crypto, with no register write available yet to clear
+        // any of them individually - checks the aggregator's priority
+        // encoder resolves to the LOWEST active source id (per the
+        // architecture doc: "cpu_irq_id[2:0] (lowest active source
+        // ID)"), i.e. 0 (aes0), not the highest. gen_irq_aggregator_v2.py
+        // fixes a real bug here: the organizer's original generator's
+        // priority encoder checked the HIGHEST bit first (highest-wins,
+        // the opposite of documented behavior) - see irq_crypto's own
+        // dedicated testbench (tb_hard_irq_crypto.v, T702) and NOTES.md
+        // for the full empirical confirmation and fix. ----
         // r_pend latches on a clock edge, so give it one cycle to catch
         // up with aes3's just-observed done pulse before checking it.
         repeat (2) @(posedge clk);
-        check(cpu_crypto_irq === 1'b1 && cpu_crypto_irq_id === 3'd3, "T407");
+        check(cpu_crypto_irq === 1'b1 && cpu_crypto_irq_id === 3'd0, "T407");
 
         // ---- T408: the AES-node's own co-located SRAM (sram_30,
         // co-located with aes0 at node (3,0) per the architecture doc)

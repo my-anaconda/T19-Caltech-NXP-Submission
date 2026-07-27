@@ -1025,3 +1025,118 @@ privileged slot; T606 watchdog unlock/load/enable and the real counter
 categories together via `run_suite.sh` - `reset_sync` (5/5), `noc_local`
 (6/6), `noc_routing` (10/10), `aes_basic` (8/8), `dma_basic` (10/10),
 `apb_periph` (6/6) - **45/45 passing**, zero manual RTL edits.
+
+Also noticed in passing (not itself a bug, just worth recording): Step 4
+does not always route the APB peripheral cluster through the organizer's
+`apb_fabric5` module at all - `t19_hard_test10`'s top-level inlines its
+own ad-hoc `paddr[15:12]==5/6/7`-style decode directly, bypassing
+`u_apb_fab`/`gen_apb_fabric_v2` entirely for this run (it happened to get
+the same correct semantics independently). This is the same class of
+"Step 4 invents its own structure when the doc under-specifies it" seen
+below with `irq_crypto`'s address.
+
+## `irq_crypto` category (T701-T710) - a real, documented contradiction in the
+## organizer's own priority-encoder generator
+
+Unlike the peripheral cluster, the architecture doc gives `u_irq_crypto`/
+`u_irq_periph` no fixed, documented CPU-visible register address (no
+"Slot N" entry the way uart/gpio/timer/wdt have) - and empirically, Step 4
+doesn't even route it through a consistent decode scheme across runs
+(`t19_hard_test10` inlines its own `paddr[15:12]==5/6/7` slots for
+icrypto/iperiph/perf; a differently-generated run could easily place
+these anywhere, or nowhere at all - see the DMA-config gap in
+`dma_basic` for a precedent). So `tb_hard_irq_crypto.v` does what
+`aes_basic`/`dma_basic` already established as the right call for an IP
+with an undocumented/unreliable CPU-facing address: force/release
+directly on the aggregator's own ports (`irq_src`, and its plain
+always-ready APB slave port `psel`/`penable`/`pwrite`/`paddr`/`pwdata`/
+`prdata`) - this exercises the real aggregator RTL exhaustively and
+deterministically, independent of whatever address (if any) Step 4
+invents this run.
+
+**The bug, found by reading `gen_irq_aggregator` before writing any
+testbench code.** The architecture doc is explicit: *"Two independent
+8-source IRQ aggregators. Each outputs cpu_irq (level) and cpu_irq_id[2:0]
+(lowest active source ID)."* But the generator's priority encoder checks
+`r_pend[7]` first, then `[6]`, down to `[0]` - i.e. **highest**-index-wins,
+the exact opposite of documented behavior. T702 is the direct test for
+this: force two sources pending at once (src[0] and src[3]) and check
+`cpu_irq_id` resolves to the lower, 0. Confirmed empirically against the
+unpatched `t19_hard_test10` (this one test failed, all others passed)
+before writing any fix - exactly the predicted, isolated failure.
+Fixed in a new `gen_irq_aggregator_v2.py`: reversed the check order to
+test bit 0 first. Everything else (register map, edge/level/polarity/
+soft-IRQ logic, the always-ready APB slave interface) is unchanged.
+
+This bug wasn't new - it was already latent in `aes_basic`'s own T407,
+which asserted `cpu_irq_id === 3'd3` (the *highest* of four simultaneously
+-pending AES done sources) and had been passing precisely because it was
+validating the bug, not the spec. Updated T407 to assert `3'd0` (the
+correct, lowest-id answer) once the generator was fixed, with a comment
+pointing at this category's writeup.
+
+**Two testbench-only issues found and fixed along the way (real DUT
+behavior, just not what my first draft of the testbench assumed):**
+- Clearing a pending bit (`0x014` write) while its raw source is *still*
+  forced active raced against the aggregator's own accumulate logic on
+  the same clock edge and didn't reliably stick (T704/T706b failed on
+  first pass with stale pending bits persisting across supposedly-clean
+  test boundaries). Fixed by always deasserting the raw source first,
+  settling a cycle, and only then clearing - which is also just more
+  realistic driver behavior (service/mask the device, then clear
+  pending), and matches the doc's own description of level-sensitive
+  interrupts (a cleared pending bit reasserts immediately if the level
+  is still active - confirmed directly as real, correct DUT behavior in
+  T705, not a bug).
+- Fixing the priority order surfaced a *second*-order regression in
+  `dma_basic`'s existing T508 (`cpu_irq_id === 3'd5` after dma1
+  completes): dma0's own done/irq_en state from the earlier T505 is
+  still latched and was never re-armed or cleared, so its level-mode
+  src[4] source was still genuinely live - with the fix, id correctly
+  (and now legitimately) resolved to 4, the lower of the two, not 5.
+  T508's actual intent was to check dma1's src[5] wiring in isolation,
+  so fixed by masking src[4] off (and clearing its now-masked pending
+  bit) via the aggregator's own register interface immediately before
+  the check - restoring the isolation the test was always meant to have.
+
+Tests: T701 single source resolves cleanly; **T702 the key lowest-id
+test**; T703 raw register readback (`0x000`) matches the forced pattern;
+T704 the enable mask (`0x008`) blocks a disabled source from ever
+setting pend, even while its raw line is high; T705 level vs. edge mode
+(`0x00C`) - level is sticky/independent of an isolated clear, edge fires
+once and stays cleared; T706 polarity inversion (`0x010`); T707
+software-triggered IRQ (`0x01C`, using src[7] - unused by any real
+hardware source); T708 clean idle once everything's cleared; T709/T710
+confirm `u_irq_crypto`/`u_irq_periph` are genuinely independent instances
+(driving one doesn't touch the other).
+
+**Verified end-to-end on yet another fresh regeneration (`t19_hard_test11`,
+all fixes from this session wired in from the start)**: all seven
+categories together via `run_suite.sh` - `reset_sync` (5/5), `noc_local`
+(6/6), `noc_routing` (10/10), `aes_basic` (8/8), `dma_basic` (10/10),
+`apb_periph` (6/6), `irq_crypto` (10/10) - **55/55 passing**. Honesty
+note: this specific regeneration's top-level (`crypto_soc.v`) failed to
+elaborate at all until 4 lines were patched in a scratch copy (not
+committed, not touching the real generator) - see the `perf_counter`
+finding immediately below. Every category through `irq_crypto` in this
+writeup is otherwise untouched and fully verified against the real,
+unpatched `t19_hard_test10`/`test11` output.
+
+**New finding, NOT fixed (out of scope for `irq_crypto`, tracked for the
+upcoming `perf_counter` pass):** `t19_hard_test11`'s top-level contains
+```
+assign perf_cnt0 = u_perf.u_cnt0.count;
+assign perf_cnt1 = u_perf.u_cnt1.count;
+assign perf_cnt2 = u_perf.u_cnt2.count;
+assign perf_cnt3 = u_perf.u_cnt3.count;
+```
+- a hierarchical cross-module reference assuming `u_perf` (from
+`gen_perf_counter`, a generator not yet touched this session) internally
+instantiates four sub-modules named `u_cnt0`..`u_cnt3`, each with a
+register named `count`. This doesn't match the real generator's output
+(iverilog: "Unable to bind wire/reg/memory `u_perf.u_cnt0.count`"),
+failing elaboration outright - every category's testbench is blocked by
+this on any run where Step 4 writes it this way, regardless of which IP
+category is under test. Worked around here by patching a throwaway copy
+(`assign perf_cntN = 32'h0;`) purely to unblock verifying this session's
+own fixes; the real fix belongs to the `perf_counter` pass.

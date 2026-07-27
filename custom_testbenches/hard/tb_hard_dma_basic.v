@@ -185,7 +185,32 @@ module tb_hard_dma_basic;
         check(dut.u_noc_mesh.u_sram_02.mem[7][31:0] === 32'hD501_0507, "T507");
 
         // ---- T508: dma1_irq correctly feeds irq_crypto src[5] - a
-        // DIFFERENT id from dma0's src[4] (T505) ----
+        // DIFFERENT id from dma0's src[4] (T505). Since irq_aggregator's
+        // priority encoder now correctly resolves the LOWEST active
+        // source id (see gen_irq_aggregator_v2.py / tb_hard_irq_crypto.v)
+        // and dma0's own done/irq_en status from T505 is still latched
+        // (nothing here re-arms or clears it, so its level-mode src[4]
+        // stays live), src[4] would otherwise still win over src[5] on
+        // this check - correctly, but that's not what THIS test is
+        // isolating. Mask src[4] off via the aggregator's own enable
+        // register first, so this checks dma1's src[5] wiring cleanly,
+        // in true isolation, matching the test's original intent ----
+        force dut.u_irq_crypto.psel = 1'b1; force dut.u_irq_crypto.penable = 1'b1;
+        force dut.u_irq_crypto.pwrite = 1'b1; force dut.u_irq_crypto.paddr = 12'h008;
+        force dut.u_irq_crypto.pwdata = 32'hFFFF_FFEF;  // disable bit4 (dma0) only
+        @(posedge clk);
+        // Disabling only prevents FUTURE re-accumulation - src[4]'s
+        // pending bit is already latched (sticky) from T505 and needs an
+        // explicit clear too, same lesson as tb_hard_irq_crypto.v's
+        // T704/irq_crypto_clear: this is now safe since r_en[4]=0 already
+        // masks the still-live raw source out of the OR-accumulate term.
+        force dut.u_irq_crypto.paddr = 12'h014;
+        force dut.u_irq_crypto.pwdata = 32'h0000_0010;  // clear bit4's pend
+        @(posedge clk);
+        release dut.u_irq_crypto.psel; release dut.u_irq_crypto.penable;
+        release dut.u_irq_crypto.pwrite; release dut.u_irq_crypto.paddr;
+        release dut.u_irq_crypto.pwdata;
+
         axi_write(node_addr(0, 2, 8), 32'hD501_0508);
         repeat (5) @(posedge clk);
         dma_cfg_write(1, 12'h000, node_addr(0, 2, 8));

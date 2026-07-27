@@ -584,7 +584,7 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric"):
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric", "irq_aggregator"):
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -610,6 +610,9 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
         elif spec["ip_type"] == "apb_fabric":
             from gen_apb_fabric_v2 import gen_apb_fabric_v2
             files = gen_apb_fabric_v2(spec)
+        elif spec["ip_type"] == "irq_aggregator":
+            from gen_irq_aggregator_v2 import gen_irq_aggregator_v2
+            files = gen_irq_aggregator_v2(spec)
         else:
             from gen_aes_v2 import gen_aes128_v2
             files = gen_aes128_v2(spec)
