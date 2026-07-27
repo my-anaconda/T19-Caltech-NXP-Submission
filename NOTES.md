@@ -735,3 +735,43 @@ time - a strong argument for continuing this same "build one category,
 actually run it, chase every real failure to its root cause" approach
 rather than writing all remaining categories' testbenches speculatively
 before running any of them.
+
+## `noc_routing` category (T301-T310) - 10/10, first try, no new bugs
+
+Built `custom_testbenches/hard/tb_hard_noc_routing.v`: real CPU-initiated
+writes to REMOTE mesh nodes (not just node (0,0) local delivery), covering
+every reachable node shape - 1/2/3 hops East, 1/2 hops toward +Y, the
+doc's own worked X-then-Y example (node (1,1)), the opposite mesh corner
+(3,2) at maximum hop count, back-to-back writes to two different remote
+nodes (no cross-node aliasing), and an explicit check that the write's
+D-channel ack survives the full round trip back to the CPU even at
+maximum hop count (not just that the data lands). **All 10 passed on the
+very first attempt** - this is the category that most directly exercises
+the original router-forwarding fix from earlier in this project, and it
+held up completely once the crossbar/NI issues from `noc_local` were
+fixed. (One thing worth flagging, not a bug found: the architecture doc
+itself has an internal inconsistency between its prose description of the
+XY routing convention in section 05 ("dest_y > NODE_Y -> go North") and
+the labels in its own step-by-step walkthrough diagram in section 02
+(which labels a dest_y > node_y hop "go South (p1)" instead). This
+implementation follows section 05's explicit prose statement, which is
+self-consistent with both `gen_router_v2.py`'s own logic and
+`gen_noc_mesh.py`'s own link-wiring convention - internally consistent,
+but worth knowing about in case a golden TB was built against the other
+reading.)
+
+**Also found**: Step 4's LLM does not reliably follow an exact requested
+instance name for the `noc_mesh` wrapper - despite explicit prompt
+guidance added after the `noc_local` work ("name this instance EXACTLY
+u_noc_mesh"), two different regenerations produced `noc_mesh` and `u_noc`
+respectively, neither matching. Rather than keep fighting LLM instance-
+naming variance, added `custom_testbenches/hard/run_suite.sh`, which
+auto-detects whatever instance name a given run actually used (via a
+simple grep on the generated `crypto_soc.v`) and substitutes it into a
+working copy of each testbench before compiling - a practical
+accommodation instead of a brittle exact-match requirement.
+
+**Verified end-to-end on a fresh, fully unpatched regeneration
+(`t19_hard_test6`)**: all three categories together - `reset_sync` (5/5),
+`noc_local` (6/6), `noc_routing` (10/10) - **21/21 passing**, zero manual
+RTL edits, via `run_suite.sh t19_hard_test6/hard`.
