@@ -775,3 +775,93 @@ accommodation instead of a brittle exact-match requirement.
 (`t19_hard_test6`)**: all three categories together - `reset_sync` (5/5),
 `noc_local` (6/6), `noc_routing` (10/10) - **21/21 passing**, zero manual
 RTL edits, via `run_suite.sh t19_hard_test6/hard`.
+
+## `aes_basic` category (T401-T408) - a genuine cryptographic bug, found the hard way
+
+Per the architecture doc's own explicit callout ("The AES engines are
+standalone instances, not connected to the router's local AXI port"),
+there is no CPU-programmable path to them at all - the only way to test
+them is `force`/`release` on their own input ports directly
+(`dut.u_aes0.key_in` etc.), same as unit-testing an isolated IP block
+that happens to be instantiated inside a larger SoC. `gen_aes128`
+(organizer-provided) turned out to implement a REAL AES-128 core (actual
+Rijndael S-box, real key schedule, real MixColumns via GF(256) `xtime`) -
+not a placeholder - so `custom_testbenches/hard/tb_hard_aes_basic.v` uses
+the actual NIST FIPS-197 validation vector (key=00010203...0c0d0e0f,
+plaintext=00112233...ccddeeff, expected ciphertext=69c4e0d8...70b4c55a)
+to check genuine cryptographic correctness, not just "some data came out".
+
+**First run: wrong ciphertext.** `busy`/`done` timing was perfect (10
+cycles, correct pulse), and forcing the key in and reading back
+`round_key[1]` one cycle later gave EXACTLY the documented FIPS-197 value
+(`d6aa74fd...`) - so the S-box and key schedule were clearly right, but
+the final ciphertext was completely wrong. This took a genuinely long
+root-cause chase (see full detail in the session transcript) because two
+independent, self-consistent-in-isolation subsystems were combined
+incorrectly: `shift_rows` and `mix_col` both operate correctly if you
+assume this module's own byte-index convention (`s[bi*8+:8]`, bi=0 is
+bits[7:0] - the LAST byte of however a 128-bit literal is naturally
+written) maps bi-ascending directly onto FIPS row-ascending within each
+4-byte group - but it doesn't: bi-ascending within a group is actually
+FIPS row-*descending*. Both functions silently apply their transform to
+the wrong (reversed) row order. Every simpler hypothesis was checked and
+ruled out empirically before landing on this: byte reversal conventions,
+per-word swaps, transposes - none of them fixed both `round_key[1]` AND
+the final ciphertext simultaneously, which is what eventually pointed at
+a structural row-order bug rather than a testbench byte-ordering
+question. The fix was derived mechanically, not by further hand-algebra:
+built an independent, from-scratch AES-128 in Python (2D `state[r][c]`
+arrays, GF(256) multiplication tables), confirmed it reproduces the
+FIPS-197 vector exactly, then wrapped that trusted transform with the
+(already-proven-necessary) index reversal on both sides to derive
+exactly what `shift_rows`/`mix_col` must compute on the raw bi-indexed
+array - removing the possibility of a second hand-derivation error
+compounding the first. Confirmed byte-for-byte against FIPS-197 in
+Python *before* touching the Verilog generator, then confirmed again via
+the real simulator.
+
+New file: `agent/rtl_gen_lib_ext/gen_aes_v2.py` (`gen_aes128_v2`), wired
+into the agent the same way as the other fixes (`ip_type: aes128`).
+Tests: T401 real FIPS-197 correctness on aes0; T402/T403 busy/done
+timing; T404-406 the other three engines are independent, correctly-
+instantiated cores (not accidentally sharing state) producing the same
+correct result; T407 the IRQ aggregator's priority encoder correctly
+resolves the highest-pending AES source once all four have fired
+(needed a 2-cycle settle after the last `done` pulse for `r_pend` to
+latch - a testbench timing detail, not an RTL issue); T408 the AES-node's
+own co-located SRAM (`sram_30`, co-located with aes0) still works
+correctly via normal CPU NoC routing, confirming the AES engine's
+presence doesn't interfere with the SRAM's real function. **All 8/8
+passing.**
+
+**A fresh regeneration with the AES fix wired in (`t19_hard_test7`)
+immediately caught the crossbar `slave_ranges` sizing issue flagged as
+"worth re-checking" back in the `noc_local` section - this time for
+real**: `reset_sync` and `noc_local` passed clean, but `noc_routing`
+timed out completely and `aes_basic`'s own T408 (a NoC-routed write to
+the AES-colocated SRAM) timed out too - while every purely-local test on
+the SAME regeneration passed fine. Checked the actual inferred spec:
+Step 2 had again inferred S0's `slave_ranges` size as `0x10000000` (same
+undersized value from `t19_hard_test4`, requiring `addr[31:28]==0`
+exactly and so rejecting any write to a non-(0,0) node) - even though a
+LATER regeneration (`test5`/`test6`) had correctly inferred `0x80000000`.
+This is confirmed now as genuine LLM-inference non-determinism on a
+single critical parameter, not a one-off mistake - prompt guidance alone
+isn't reliable enough for something this load-bearing (nearly EVERY
+category needs the CPU to reach a remote node). Since the correct value
+is fully deterministic (S1/S2 always sit at `0xF0xx_xxxx` in this
+architecture, so `0x80000000` is always a safe, non-overlapping choice
+for S0 regardless of the doc's exact numbers), added
+`fix_crossbar_s0_window()` to the agent: runs right after Step 2, widens
+S0's inferred window in place if it's under `0x80000000`, before Step 3
+ever reads it - handles both YAML formats Step 2 has been observed
+emitting (flow-style `{base: .., size: ..}` and block-style base/size on
+separate lines). Verified in isolation (unit test against the actual
+`test7` spec text), then verified end-to-end: manually applied the fix
+to `test7`'s spec + regenerated just the crossbar RTL -> all **29/29**
+tests across all four categories passed. Then ran a completely fresh
+regeneration from scratch (`t19_hard_test8`, fix wired in from the
+start) to confirm full automation - this run happened to infer
+`0x80000000` correctly on its own (further confirming the
+non-determinism), so the auto-fix correctly no-op'd, and all **29/29**
+tests passed again with zero manual intervention either way.

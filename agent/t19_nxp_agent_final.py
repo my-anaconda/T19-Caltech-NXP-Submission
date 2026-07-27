@@ -500,11 +500,58 @@ def try_stitch_noc_mesh(yaml_paths, out_dir, rtl_gen_lib_dir):
     return mesh_path, internal_files
 
 
+def fix_crossbar_s0_window(yaml_paths):
+    """Widen the axi_lite_crossbar's S0 (NoC) slave_ranges window in place
+    if Step 2 inferred one too small to cover valid NoC destination
+    addresses - this parameter has been observed to be LLM-inference-
+    non-deterministic across otherwise-identical regenerations (one run
+    correctly inferred base=0/size=0x80000000, matching IP_CONSTRAINTS'
+    own worked example; a later run inferred size=0x10000000 instead,
+    which requires addr[31:28]==0000 exactly and so silently rejects any
+    write to a node with dest_x/dest_y != 0 - confirmed via a real hang:
+    noc_routing's entire testbench timed out and aes_basic's own
+    SRAM-via-NoC-routing check timed out too, while every purely-local
+    test on the SAME regeneration passed fine). Since S1/S2 are always at
+    0xF0xx_xxxx in this architecture (top bit set), size=0x80000000 (top
+    bit clear) is always a safe, non-overlapping choice for S0 regardless
+    of the doc's exact addresses - so this is corrected deterministically
+    here instead of continuing to depend on the LLM inferring it right
+    every time.
+    """
+    for yp in yaml_paths:
+        text = yp.read_text(encoding="utf-8")
+        spec = _parse_flat_yaml(text)
+        if spec.get("ip_type") != "axi_lite_crossbar":
+            continue
+        if "slave_ranges" not in text:
+            continue
+        # Format-agnostic: Step 2 has been observed emitting slave_ranges in
+        # both flow style (`- {base: 0x.., size: 0x..}`) and block style
+        # (`- base: 0x..` / `  size: 0x..` on separate lines) across
+        # different regenerations - just take the FIRST "size:" line
+        # anywhere in this file (S0, the first list entry) rather than
+        # parsing full YAML list structure.
+        lines = text.splitlines(keepends=True)
+        for idx, line in enumerate(lines):
+            sm = re.search(r'size:\s*["\']?(0x[0-9a-fA-F]+)["\']?', line)
+            if not sm:
+                continue
+            size0 = int(sm.group(1), 16)
+            if size0 < 0x80000000:
+                print(f"[FIX] {yp.name}: S0 slave_range size {sm.group(1)} is too "
+                      f"small (requires addr[31:28]==0 exactly, rejecting any "
+                      f"non-(0,0) NoC destination) - widening to 0x80000000.",
+                      file=sys.stderr)
+                lines[idx] = re.sub(r'size:\s*["\']?0x[0-9a-fA-F]+["\']?', 'size: 0x80000000', line, count=1)
+                yp.write_text("".join(lines), encoding="utf-8")
+            break  # only ever touch the FIRST size: line (S0)
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni"):
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128"):
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -524,9 +571,12 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
         elif spec["ip_type"] == "axi_lite_sram":
             from gen_sram_v2 import gen_axi_lite_sram_v2
             files = gen_axi_lite_sram_v2(spec)
-        else:
+        elif spec["ip_type"] == "tilelink_ni":
             from gen_ni_v2 import gen_tilelink_ni_v2
             files = gen_tilelink_ni_v2(spec)
+        else:
+            from gen_aes_v2 import gen_aes128_v2
+            files = gen_aes128_v2(spec)
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         generated = []
@@ -665,6 +715,8 @@ Task:
         yaml_path.write_text(block, encoding="utf-8")
         yaml_paths.append(yaml_path)
         print(f"[STEP2] Saved {fname}", file=sys.stderr)
+
+    fix_crossbar_s0_window(yaml_paths)
 
     # --- Step 3: generate IP RTL from YAML specs ---
     print("[STEP3] Generating IP RTL from YAML specs...", file=sys.stderr)
