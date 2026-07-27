@@ -144,39 +144,65 @@ before submission, this repo includes a from-scratch testbench suite —
 against *actual iverilog/vvp simulation*, not just compilation:
 
 ```
-custom_testbenches/hard/
-├── run_suite.sh              ← driver: runs all 11 testbenches against one RTL output dir
-├── tb_hard_common.vh         ← shared clock/reset/timeout/scoreboard macros
-├── tb_hard_reset_sync.v
-├── tb_hard_noc_local.v
-├── tb_hard_noc_routing.v
-├── tb_hard_aes_basic.v
-├── tb_hard_dma_basic.v
-├── tb_hard_apb_periph.v
-├── tb_hard_irq_crypto.v
-├── tb_hard_perf_counter.v
-├── tb_hard_irq_periph.v
-├── tb_hard_soc_cfg_regs.v
-└── tb_hard_mailbox.v
+custom_testbenches/
+├── hard/
+│   ├── run_suite.sh              ← driver: runs all 12 testbenches against one RTL output dir
+│   ├── tb_hard_common.vh         ← shared clock/reset/timeout/scoreboard macros
+│   ├── tb_hard_reset_sync.v
+│   ├── tb_hard_noc_local.v
+│   ├── tb_hard_noc_routing.v
+│   ├── tb_hard_aes_basic.v
+│   ├── tb_hard_dma_basic.v
+│   ├── tb_hard_apb_periph.v
+│   ├── tb_hard_irq_crypto.v
+│   ├── tb_hard_perf_counter.v
+│   ├── tb_hard_irq_periph.v
+│   ├── tb_hard_soc_cfg_regs.v
+│   ├── tb_hard_mailbox.v
+│   └── tb_hard_integration.v
+└── medium/
+    ├── run_suite.sh              ← same driver pattern, medium-tier RTL
+    ├── tb_medium_common.vh
+    ├── tb_medium_reset_sync.v
+    ├── tb_medium_noc_topology.v
+    ├── tb_medium_aes0_encrypt.v
+    ├── tb_medium_aes1_encrypt.v
+    ├── tb_medium_irq_agg.v
+    ├── tb_medium_sram_ni_idle.v
+    ├── tb_medium_noc_ni_basic.v
+    ├── tb_medium_noc_local_loop.v
+    ├── tb_medium_noc_ew_routing.v
+    ├── tb_medium_noc_ns_routing.v
+    ├── tb_medium_noc_2hop.v
+    └── tb_medium_irq_id_order.v
 ```
 
-Usage, once you have a generated `hard`-tier RTL output directory (e.g. from
-the `Running` steps above with `--problem hard`):
+Usage, once you have a generated RTL output directory (e.g. from the
+`Running` steps above with `--problem hard` or `--problem medium`):
 
 ```bash
-custom_testbenches/hard/run_suite.sh <path-to>/ICLAD26-NXP-Problems/result/<run_id>/hard
+custom_testbenches/hard/run_suite.sh   <path-to>/ICLAD26-NXP-Problems/result/<run_id>/hard
+custom_testbenches/medium/run_suite.sh <path-to>/ICLAD26-NXP-Problems/result/<run_id>/medium
 ```
 
-Each testbench targets one IP category end-to-end (reset/clock-domain
-synchronization, NoC local/routing, AES, DMA, APB peripherals, crypto IRQs,
-performance counters, peripheral IRQs, SoC config-space registers, and the
-mailbox) and reports `[PASS]`/`[FAIL]` per check. This suite is how the real
-bugs described in `NOTES.md` were actually found — in both the organizer's
-own RTL generators and the Step-4 LLM-generated top-level SoC integration —
-each one root-caused against a real simulation failure and fixed, then
-reverified with a completely fresh, unpatched regeneration. Current status:
-**91/91 checks passing** across all eleven hard-tier categories on a fresh
-regeneration. See `NOTES.md` for the category-by-category bug writeups.
+Each testbench targets one IP category end-to-end and reports `[PASS]`/
+`[FAIL]` per check, using the exact `[PASS] T<id>` / `[FAIL] T<id>`
+convention the organizer's own `evaluate.py` parses, so these results are
+directly comparable to real scoring once a golden TB is available. This
+suite is how the real bugs described in `NOTES.md` were actually found —
+in the organizer's own RTL generators, this repo's own corrected `_v2`
+generators, and the Step-4 LLM-generated top-level SoC integration — each
+one root-caused against a real simulation failure and fixed, then
+reverified with a completely fresh, unpatched regeneration. Current
+status: **hard tier 96/96** across all twelve categories (one documented,
+understood gap in a rare `u_perf` wiring variant — see `NOTES.md`);
+**medium tier 50/52** across all twelve categories (one documented,
+understood Step-2 YAML-inference gap in `reset_sync`'s stage count — see
+`NOTES.md`), verified against a dev baseline with every deterministic-
+generator-backed IP regenerated fresh from the current generator
+functions, pending final confirmation against a truly fresh end-to-end
+regeneration. See `NOTES.md` for the full category-by-category bug
+writeups.
 
 ## What's different from the starter/reference agents
 

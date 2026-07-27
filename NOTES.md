@@ -1737,3 +1737,92 @@ S2-routed (directly, one-hop, or two-hop) and fail together with
 design tracking, not masking, that pre-existing documented gap.
 `t19_hard_test25` (fully patched): **96/96** across all twelve
 categories.
+
+## Hard tier done - all 12 categories, 96/96. Medium tier: all 12 custom
+## testbenches built, 50/52 - two real generator bugs found and fixed,
+## one real Step-2 inference gap found and documented (2026-07-27)
+
+With hard tier complete, started the medium-tier (`noc_aes_soc`) custom
+testbench suite - same methodology, same 12-category breakdown as
+`evaluate.py`'s own map (`reset_sync`, `noc_topology`, `aes0_encrypt`,
+`aes1_encrypt`, `irq_agg`, `sram_ni_idle`, `noc_ni_basic`,
+`noc_local_loop`, `noc_ew_routing`, `noc_ns_routing`, `noc_2hop`,
+`irq_id_order` - 52 checks total). New directory:
+`custom_testbenches/medium/` (`tb_medium_common.vh` + 12 per-category
+files + `run_suite.sh`, same structure as the hard-tier suite).
+
+Medium's architecture is simpler than hard's in every dimension (6-node
+2x3 mesh vs. 4x3, no DMA/mailbox/perf/APB cluster, a single IRQ
+aggregator, AES engines exposed as DIRECT top-level ports instead of
+force-only) but critically has NO crossbar between the CPU and the mesh -
+the CPU's AXI4-Lite master goes straight into node (0,0). This absence of
+buffering immediately exposed two real, previously-latent bugs that
+hard tier's own crossbar happened to mask:
+
+**Bug 1 - `gen_axi_lite_sram_v2`'s write-path handshake could never
+complete for a LOCAL (same-node) write.** `awready`/`wready` were each a
+self-referential one-cycle toggle (`awready <= !pending_w && awvalid &&
+!awready`) - by construction they flip on then off on ALTERNATING clock
+cycles, independently of each other. `tilelink_router`'s local-delivery
+path waits for `sram_awready && sram_wready` to be true on the SAME
+cycle before advancing past S_SEND - two independently-alternating
+one-cycle pulses are never guaranteed to land together, and confirmed
+directly via simulation they never did, hanging any CPU write to a
+node's own local SRAM forever. Root-caused via `tb_medium_reset_sync.v`'s
+T105 (a real hang, not a timeout-by-design) - traced signal-by-signal
+through `u_ni_00`/`u_router_00`/`u_sram_00` hierarchically to find
+`sram_awready`/`sram_wready` literally never coinciding. Not caught by
+hard tier's own 96/96 because none of its tests happen to route a write
+through this exact same-node LOCAL path in a way that exposes it (DMA's
+own master port has different AXI timing than a CPU/NI-driven write).
+Fixed by rewriting the write path with `have_aw`/`have_w` latches so
+`awready`/`wready` are simple "ready when idle" signals asserted
+TOGETHER, correctly handling both the same-cycle AW+W convention every
+BFM in this codebase uses and staggered AW/W arrival per the AXI4 spec.
+Verified: regenerated a real `u_sram_00.v` with the fix and confirmed a
+previously-hanging write now completes; regression-checked against
+`t19_hard_test27`'s full RTL (all its `u_sram_*` instances regenerated
+with the fix) - identical 94/96 result, confirming zero behavioral change
+for the paths hard tier already exercises.
+
+**Bug 2 that turned out not to be a bug** - a second, real-looking hang
+(`axi_bvalid` never asserting in `u_ni_00.v`, a genuine same-cycle
+`st==S_IDLE`-vs-`tl_d_valid` race) was chased for a while before
+realizing `t19_medium_test3` (the only medium regeneration available
+pre-dating this debugging session) is simply STALE - `gen_ni_v2.py`
+already has this exact fix (its own docstring documents the identical
+race, found and fixed earlier in this project's history). A third,
+similar false alarm turned up in AES: `t19_medium_test3`'s `u_aes0.v`/
+`u_aes1.v` were generated before `gen_aes128_v2`'s shift_rows/
+mix_columns fix existed, so the NIST test vector initially failed there
+too. **Lesson generalized**: rather than keep chasing individually-stale
+IP files, every deterministic-generator-backed module
+(`u_sram_*`/`u_ni_*`/`u_aes0`/`u_aes1`/`u_router_*`/`u_irq_agg`) in the
+dev-baseline RTL was regenerated fresh from the CURRENT generator
+functions before further testing - this is the actual dev baseline used
+for the rest of the medium-tier suite (`/tmp/medium_test3_fully_patched`
+locally; not something that ships, since the real agent always calls the
+current generators live).
+
+**Bug 3 - a real, still-open Step-2 YAML-inference gap**: the
+architecture doc's reset_sync diagram shows the same 4-FF chain as hard
+tier ("Determine the number of synchronizer stages from the structure of
+the diagram"), but this regeneration's `u_rst` came out with
+`STAGES=3` (the generator's own bare default, unless Step 2's YAML
+inference explicitly overrides it - which it correctly did for hard
+tier's own reset_sync, confirmed 4/4 across `test24`/`test25`/`test27`,
+but did not for this medium regeneration). `tb_medium_reset_sync.v`'s
+T101/T103 correctly hardcode the doc's spec (4 cycles) and fail against
+this real gap, exactly as intended - not weakened to match whatever a
+given regeneration happens to produce. Since this is a Step 2 LLM
+inference issue (not a deterministic generator bug), fixing it requires
+prompt-guidance verified against a real model call - flagged as the
+first thing to re-check once a working `EXPRESS_MODE_KEY` is available,
+rather than guessed at blind.
+
+**Verified via `run_suite.sh` against the fully-patched baseline**: all
+twelve categories together - **50/52**, with T101/T103 (Bug 3 above) the
+only non-passing checks, exactly as expected and understood. Not yet
+verified against a truly fresh end-to-end regeneration (blocked on a
+working API key at the time of this pass) - that remains the next step
+before this can be called as fully confirmed as hard tier's 96/96.
