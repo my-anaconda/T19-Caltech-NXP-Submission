@@ -1855,3 +1855,76 @@ result, with two extra findings:
 
 Medium tier's real-regeneration score: **50/52**, matching the dev
 baseline exactly, both non-passing checks fully understood.
+
+## Easy tier started - 7 of 15 categories built, 37/37 (2026-07-27)
+
+With medium tier confirmed, started the easy-tier (`secure_periph_soc`)
+custom testbench suite - same methodology, `evaluate.py`'s own 15-category
+map (`basic_rw`, `uart_tx`, `gpio_irq`, `timer`, `watchdog`, `privilege`,
+`irq_aggregator`, `reset_sync`, `wdt_window`, `irq_priority`,
+`addr_decode`, `uart_rx`, `timer_pwm`, `gpio_level`, `wdt_unlock` - 58
+checks total). New directory `custom_testbenches/easy/`
+(`tb_easy_common.vh`, adapted directly from the organizer's own
+`tb_top_skeleton.v` `ahb_write`/`ahb_read` tasks, + per-category files +
+`run_suite.sh`). Tested against `t19_easy_test4`, an existing
+regeneration.
+
+Easy tier's architecture is the simplest of the three (single AHB-Lite
+master, one bridge, one 5-slave APB fabric, no NoC, no crossbar) and its
+own `tb_top_skeleton.v` already documents the full address map and BFM
+timing convention, making this the smoothest category-building pass of
+the whole session - 7 of 7 categories built so far pass cleanly (some
+after a real debugging detour, documented below), no generator bugs
+found yet (unlike hard/medium, none of easy's own IPs are on the
+intercepted-generator list except `apb_fabric5`/`irq_aggregator`, and
+both matched their doc's spec correctly on first read).
+
+**One noteworthy finding, not a bug**: easy tier's `irq_aggregator.v` is
+priority-encoded **highest-index-wins** (`if(r_pend[7]) vid=7; else
+if(r_pend[6])...`), the OPPOSITE of hard/medium's aggregators (which
+`gen_irq_aggregator_v2` deliberately fixes to lowest-wins). This is
+CORRECT, not a regression: easy's own architecture doc explicitly states
+"Priority encoder selects the highest pending source (src7=highest)" -
+the opposite convention from hard/medium's own docs. Confirmed this
+tier's generated `irq_aggregator.v` was never routed through
+`gen_irq_aggregator_v2` at all (no "(v2 - fixed priority order)" comment
+in its header, unlike medium's `u_irq_agg.v`) - whatever it does receive
+correctly implements ITS OWN tier's documented contract as-is.
+
+**A real testbench-design lesson, confirmed twice**: both `gpio_irq`
+(T302) and `irq_aggregator` (T704/T705) hit the exact same
+sticky-level-clearing trap already seen multiple times this session in
+hard/medium tier's own aggregators: `apb_gpio`'s ISTAT and
+`irq_aggregator`'s own IRQ_PEND are BOTH level-mode-by-default (their
+own `IRQ_EDGE`/`r_edge` reset to 0), so a still-high underlying condition
+re-latches the pending bit on literally the same clock edge a W1C/IRQ_CLR
+write tries to clear it. Every category's clear sequence now follows
+the same two-step order proven each time: deassert/clear the RAW source
+first, THEN clear the LATCHED pending bit, with a settle cycle in
+between - this is now a standing convention across all three tiers'
+custom testbenches, not a one-off fix.
+
+**A second real testbench-design lesson (`watchdog`, T506)**:
+`wdt_rst_req` triggers a REAL async system reset
+(`async_rst_n = por_n & wdt_rst_n`, read directly from `reset_sync.v`)
+that immediately resets `apb_watchdog` itself, including its own
+`rstpulse<=0` reset branch - so the pulse can self-clear within the same
+clock edge's delta-cycles, before the very next `@(posedge clk)`
+boundary a plain polling loop would sample at. Confirmed directly:
+cycle-boundary polling missed it outright (ctr/stage/en all snapped back
+to power-on-reset values by the next sampled edge). Fixed with a
+module-scope `always @(posedge wdt_rst_req)` monitor, armed BEFORE the
+watchdog even starts counting (not just during the final wait window) -
+Verilog's event scheduling guarantees this fires on the transition
+itself no matter how quickly it's cleared afterward, and armed early
+because the actual trigger can land mid-transaction (in this case,
+during T505's own verification *read*, which itself takes several clock
+cycles while the watchdog keeps counting in the background) rather than
+neatly inside a dedicated wait block.
+
+Verified via `run_suite.sh`: **basic_rw 9/9, uart_tx 4/4, gpio_irq 5/5,
+timer 5/5, watchdog 6/6, privilege 3/3, irq_aggregator 5/5 - 37/37**
+across all seven categories built so far, no known gaps. Remaining
+eight categories (`reset_sync`, `wdt_window`, `irq_priority`,
+`addr_decode`, `uart_rx`, `timer_pwm`, `gpio_level`, `wdt_unlock`) not
+yet started.
