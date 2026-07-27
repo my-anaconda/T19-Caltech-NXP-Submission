@@ -526,10 +526,45 @@ also intercepts `axi_lite_sram`, `generated_headers` construction now
 skips mesh-internal files, `NOC_MESH_WIRING_NOTE` replaces the old
 per-router `ROUTER_V2_WIRING_NOTE` in the Step 4 prompt.
 
-**Not yet done**: this same `try_stitch_noc_mesh()` path should apply to
-medium tier too (it also has a `tilelink_router` mesh, per earlier NOTES -
-untested since this integration work targeted hard specifically); read-
-transaction testing through the mesh (writes only, so far); a genuine
-3-router-chain mesh-level test (2x2 only tests one hop through one
-intermediate - the router-only `tb_router_2hop.v` already covers 2 hops in
-isolation, but not through the full NI/SRAM stack).
+**Not yet done**: read-transaction testing through the mesh (writes only,
+so far); a genuine 3-router-chain mesh-level test (2x2 only tests one hop
+through one intermediate - the router-only `tb_router_2hop.v` already
+covers 2 hops in isolation, but not through the full NI/SRAM stack).
+
+### Confirmed working across all three tiers (2026-07-26)
+
+- **Medium** (`t19_medium_test3`): medium's own 2x3 (6-router) mesh went
+  through `try_stitch_noc_mesh()` cleanly on the first try - no
+  problem-specific tuning needed, confirming the dimension/SRAM-depth
+  inference is genuinely generic. Read the actual generated
+  `noc_aes_soc.v`: it instantiates only `noc_mesh` (no individual
+  router/NI/SRAM leakage, same as hard), wires the CPU to node (0,0), and
+  ties the other 5 nodes idle correctly (medium has no DMA, so only one
+  real injection point). Elaboration exit 0, only the same class of
+  harmless width-padding warnings.
+- **Easy** (`t19_easy_test4`): easy has no `tilelink_router` at all, so
+  `try_stitch_noc_mesh()` correctly no-ops (returns `None, set()`) and
+  Step 4 falls back to its original behaviour untouched - confirms the
+  interceptions added to `rtl_gen_from_yaml` (router_v2/sram_v2/mesh) are
+  fully inert for problems that don't use those IP types, i.e. no
+  regression risk for easy. Generation itself: exit 0, all 9 expected
+  files. (Separately noticed while checking this: easy's own
+  `tb_top_skeleton.v` needs `-g2012`, not `-g2005`, to parse at all - a
+  pre-existing skeleton-file property unrelated to any of today's
+  changes, and even at `-g2012` the skeleton itself has an apparent
+  `wire` vs `reg` mismatch on `uart_rx`/`uart_cts_n` - not investigated
+  further since it's the organizer's own skeleton file, not generated
+  RTL, and out of scope for this pass.)
+
+### Token cost check-in
+
+Summed every `*_diagnostics.json` file (the only two real LLM calls per
+run - Step 2 YAML inference and Step 4 top-level generation; Step 3's IP
+generation is pure Python, no LLM cost) across all 8 full-agent runs done
+across this NXP track so far (2 easy baseline/regression, 2 easy
+key-migration checks, 2 medium, 3 hard - the hard number includes today's
+2 additional integration-verification runs): **225,758 prompt tokens +
+97,988 completion tokens = 323,746 tokens total**, via `gemini-3.5-flash`
+(a Flash-tier model, priced for high-volume use). This is a small number
+in absolute terms - nowhere near a concerning spend for this much
+iteration.
