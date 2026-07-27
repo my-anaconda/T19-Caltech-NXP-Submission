@@ -52,9 +52,8 @@ if _env_file.exists():
         os.environ.setdefault(_key.strip(), _value.strip().strip('"').strip("'"))
 
 
-class GeminiVertexWrapper:
-    """Gemini API client wrapper - same pattern as
-    T19-Caltech-NVIDIA-Submission/src/agent.py's GeminiVertexWrapper.
+class GeminiClientWrapper:
+    """Gemini API client wrapper.
 
     Uses the plain Gemini Developer API (vertexai=False), not Vertex AI
     Express Mode: the AI Studio key issued from the frictionless GCP account
@@ -172,7 +171,7 @@ class Handler(BaseHTTPRequestHandler):
             retryable = status in (429, 500, 502, 503, 504)
             self._send_json(
                 status if isinstance(status, int) and 400 <= status < 600 else 500,
-                {"error": str(e), "retryable": retryable, "provider": "vertexai"},
+                {"error": str(e), "retryable": retryable, "provider": "gemini-developer-api"},
             )
 
 
@@ -186,7 +185,7 @@ def main():
                          help="Where to write accumulated token usage JSON (matches info.json's usage_path)")
     args = parser.parse_args()
 
-    _state["client"] = GeminiVertexWrapper()
+    _state["client"] = GeminiClientWrapper()
     _state["usage_path"] = args.usage_path
 
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
