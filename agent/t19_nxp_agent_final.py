@@ -203,7 +203,14 @@ IP_CONSTRAINTS = """
 - async_fifo: Requires [name, depth, data_width]
 - sram_sp: Requires [name, depth, data_width]
 - sram_dp: Requires [name, depth, data_width]
-- reset_sync: Requires [name, stages]
+- reset_sync: Requires [name, stages]. CRITICAL: `stages` must exactly
+  equal the number of individually labeled FF boxes drawn in THIS
+  problem's own reset-synchronizer diagram (e.g. if the diagram shows
+  FF1, FF2, FF3, FF4 as four separate boxes, stages=4 - count them
+  yourself, do not assume any default value like 3). This has been
+  confirmed to vary per problem and per regeneration if not explicitly
+  counted - re-count from the actual diagram every time, even if you
+  recall a different value from a similar-looking SoC.
 - cdc_sync: Requires [name, data_width]. Optional: [kind]
 - perf_counter: Requires [name, channels, counter_width]
 """
@@ -854,6 +861,22 @@ def fix_perf_paddr_rebase(top_level_verilog):
                 top_level_verilog)
             if decl_m and _chase_s2_routed(decl_m.group(1), depth - 1, seen):
                 return True
+            # t19_hard_test27 turned up a FOURTH variant neither the
+            # direct-expression nor the wire/assign chase above reaches:
+            # `.paddr(perf_paddr)` where `perf_paddr` is a `reg` assigned
+            # procedurally, differently, in MULTIPLE `case` arms inside an
+            # always block gated on `case (s2_araddr[7:0])` /
+            # `s2_awaddr[7:0] == ...` - there is no single "X = expr" to
+            # extract at all. Fall back to non-blocking (`<=`) assignment
+            # sites: if ANY occurrence has "s2_" within the preceding 400
+            # characters (comfortably covers the enclosing case/if
+            # condition that established this is an S2-conditioned
+            # block, in every real regeneration seen), treat it as
+            # S2-routed the same as a direct reference.
+            for nb_m in re.finditer(rf'\b{re.escape(ident)}\s*<=', top_level_verilog):
+                window_start = max(0, nb_m.start() - 400)
+                if "s2_" in top_level_verilog[window_start:nb_m.start()]:
+                    return True
         return False
 
     is_s2_routed = _chase_s2_routed(paddr_expr)
