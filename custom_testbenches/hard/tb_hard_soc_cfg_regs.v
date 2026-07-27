@@ -25,49 +25,61 @@
 // standard registered handshakes - no fused-ack workaround needed, unlike
 // the APB peripheral cluster's real AHB bridge).
 //
-// Found and fixed two real top-level bugs (both in t19_nxp_agent_final.py,
-// applied as deterministic post-processing on the Step-4-generated
-// top-level text - full detail in each fix function's own docstring):
+// Found and fixed FOUR real top-level bugs total (all in
+// t19_nxp_agent_final.py, applied as deterministic post-processing on
+// the Step-4-generated top-level text - full detail in each fix
+// function's own docstring), plus added an explicit SOC_CFG_WIRING_NOTE
+// prompt-guidance block (since none of these four requirements had ever
+// been explained to the LLM at all before):
 //
 // - fix_mbox_wr_en_pulse(): whatever drives u_mbox's wr_en port behaves
 //   as a LEVEL that can stay high for more than one clock cycle (a CPU
 //   master legally holding awvalid/wvalid through bvalid, exactly what
 //   axi_write does) - since gen_async_fifo's write logic has no edge-
 //   detection either, a single logical CPU write pushed the SAME word
-//   into the mailbox multiple times (confirmed via a real trace: wr_bin
-//   incremented by 2 for one axi_write call). Observed generated THREE
-//   structurally different ways across regenerations (assign, inline
-//   wire, and a clocked reg that still re-asserts every cycle its own
-//   condition holds) - rather than keep chasing new source-expression
-//   syntax, the fix wraps u_mbox's OWN .wr_en(...) port connection in a
-//   fresh edge-detector, which is robust regardless of source style.
+//   into the mailbox multiple times. Observed generated THREE
+//   structurally different ways across regenerations - fixed by
+//   wrapping u_mbox's OWN .wr_en(...) port connection in a fresh
+//   edge-detector, robust regardless of source style.
 // - fix_mbox_rd_rst_n(): u_mbox's rd_rst_n port tied to a constant
 //   1'b1 (never actually resetting) on one regeneration, leaving every
 //   read-side register permanently 'x' - a direct violation of the
 //   doc's own "wr_rst_n and rd_rst_n both = sys_rst_n".
+// - fix_perf_paddr_rebase(): PERF_CNT0..3 reads (SoC offsets 0x08..14)
+//   were wired to u_perf for real, but the address was passed straight
+//   through unrebased - u_perf's OWN internal register convention
+//   always starts at paddr=0 regardless of where it's mapped into the
+//   larger SoC space, so reading the documented PERF_CNT0 offset (0x08)
+//   actually landed on u_perf's cnt2. Confirmed on TWO independent
+//   regenerations even with prompt guidance already warning about it in
+//   general terms - the fix completely replaces u_perf's .paddr(...)
+//   connection with a fresh, correctly-rebased expression built
+//   directly from the crossbar's own guaranteed s2_awaddr/s2_araddr
+//   signal names. Has a safety guard: only applies when u_perf's own
+//   paddr expression genuinely traces back to an s2_ signal - a
+//   DIFFERENT regeneration (test14) reaches u_perf through a completely
+//   unrelated S1/APB-fabric slot instead, and blindly rebasing there
+//   would have broken a currently-working, unrelated addressing path.
+// - The S2 read-response state machine getting its internal rvalid
+//   register PERMANENTLY STUCK at 1 after the first read (confirmed
+//   recurring on two more regenerations) is NOT fixed with a regex -
+//   the internal register name has no doc-mandated identity and its
+//   clear-condition logic is too entangled in each run's own internal
+//   FSM to safely rewrite in isolation. Prompt guidance alone (point 3
+//   of SOC_CFG_WIRING_NOTE) has been observed getting this right on
+//   more recent regenerations, but isn't guaranteed the way the three
+//   deterministic fixes above are.
 //
-// PERF_CNT0..3/PERF_CTRL (0x08..0x18) are a genuine, confirmed top-level
-// gap that's NOT fixed here, seen identically on two separate
-// regenerations: the S2 block simply never implements those offsets at
-// all (falls through to a `default: s2_rdata_reg <= 32'b0;`, and a
-// write that's acked but goes nowhere) - u_perf IS real and correctly
-// instantiated, just reachable at a completely different, undocumented
-// address (an inline paddr[15:12]==7 slot in the S1/APB fabric window)
-// instead of through S2 at all. Unlike mbox_wr_en/rd_rst_n, there's no
-// single guaranteed wire/port name to regex against here - the S2
-// block's overall shape (which offsets it even attempts, and how)
-// varies too much across regenerations to fix safely and generically.
-//
-// A THIRD top-level bug was found on yet another regeneration
-// (t19_hard_test16) and is ALSO not fixed, for the same reason: that
-// run's S2 read-response state machine (s2_rvalid_reg) only clears on
-// `!s2_awvalid && s2_rready`, but the shared axi_read BFM only pulses
-// cpu_rready briefly - so once a first read completes, s2_rvalid_reg
-// gets stuck at 1 permanently, and every SUBSEQUENT read silently
-// returns the FIRST read's stale captured data forever after (confirmed
-// via a real trace). s2_rvalid_reg is a purely-internal, non-guaranteed
-// register name with no doc-mandated identity - not a safe regex target.
-// Documented in NOTES.md, same treatment as the DMA-config-bus gap.
+// PERF_CTRL (0x18)'s clear-all functionality remains a confirmed,
+// NOT-deterministically-fixed gap: unlike PERF_CNT0..3, it isn't simply
+// one of u_perf's own four counter registers at a rebased offset - it's
+// a distinct SoC-level concept (a specific control bit) that needs to be
+// TRANSLATED into a dedicated write to u_perf's own paddr=0. Synthesizing
+// that safely, without risking a conflict with whatever the LLM's own
+// PERF_CNT read/write wiring is already doing on the SAME psel/paddr
+// port bundle, was judged too risky for a generic regex fix - prompt
+// guidance (point 4) has gotten it right on at least one regeneration,
+// but is not guaranteed.
 module tb_hard_soc_cfg_regs;
     reg clk = 0, dsp_clk = 0, por_n;
     always #5 clk = ~clk;

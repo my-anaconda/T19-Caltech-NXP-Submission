@@ -1470,6 +1470,81 @@ all ten categories together via `run_suite.sh` - `reset_sync` (5/5),
 `PERF_CNT`/`PERF_CTRL` checks) - **77/79 passing** consistently across
 all three.
 
+## `soc_cfg_regs` follow-up - PERF_CNT0..3 fixed for real (prompt guidance +
+## a deterministic backstop), PERF_CTRL remains a genuine, deliberate gap
+
+Revisited after `mailbox` was done, prompted directly by the question of
+whether the last 2 failing checks (`T1006`/`T1007`) were fixable at all.
+Two tools were used together rather than either alone:
+
+**1. Added `SOC_CFG_WIRING_NOTE`**, a new prompt-guidance block (mirroring
+the existing `NOC_MESH_WIRING_NOTE` pattern) explaining all four bugs
+found in this area in plain terms, since NONE of them had ever been
+explained to the LLM before - it was always finding out about `axi_write`
+holding awvalid/wvalid through bvalid, `rd_rst_n`'s requirement, the
+stuck-rvalid trap, and the PERF_CNT/CTRL wiring requirement the hard way,
+from scratch, every single regeneration. Tested across two fresh
+regenerations (`test19`/`test20`): the LLM's own output directly cited
+*"Bug 1 Prevention"*/*"Bug 2 Corrected"*/*"Bug 3 Corrected"* in its own
+generated comments, and correctly implemented `mbox_wr_en`'s edge-
+detector, `rd_rst_n`, and the rvalid-clear fix ALL BY ITSELF, unprompted
+by any post-processing - real evidence the guidance genuinely changes
+what gets generated, not just decoration Step 4 ignores.
+
+**2. But PERF_CNT0..3 specifically still failed on both of those first
+two guided runs**, revealing a MORE PRECISE bug than the original note
+described: `u_perf`'s own internal register convention always starts at
+`paddr=0` (paddr=0/4/8/12 read cnt0/cnt1/cnt2/cnt3) regardless of where
+it's mapped into the larger SoC address space, but the doc places
+PERF_CNT0 at SoC offset `0x08`, not `0x00` - both regenerations passed
+the raw SoC offset straight through as `u_perf`'s own `paddr` with no
+rebasing, so reading the documented `PERF_CNT0` offset (`0x08`) actually
+read `u_perf`'s `cnt2` (confirmed directly: forced `cnt0=1` via a real
+event pulse, read SoC offset `0x08`, got back `0`). Sharpened the prompt
+note with the exact rebasing arithmetic required, AND added
+`fix_perf_paddr_rebase()` as a deterministic backstop - directly
+answering "is there a way to make this fix deterministic even if the LLM
+makes a mistake?" Rather than trying to parse and rebase whatever
+expression the LLM wrote (risky - a future correct implementation could
+get double-subtracted), it completely REPLACES `u_perf`'s `.paddr(...)`
+port connection with a fresh expression computed directly from the
+crossbar's own guaranteed, non-inferred `s2_awaddr`/`s2_araddr` names.
+**Has a safety guard that very nearly wasn't there**: `u_perf` has been
+seen reached through a COMPLETELY unrelated scheme too (`test14`: an
+inline S1/APB-fabric slot, nothing to do with S2) - blindly rebasing
+there would have broken a currently-working, unrelated addressing path
+by feeding it S2's irrelevant address. The fix now only proceeds if the
+expression feeding `paddr` genuinely traces back to an `s2_` signal
+(checked both for a direct inline expression and the common case of an
+intermediate named wire, by chasing that wire's own declaration
+elsewhere in the file) - verified this guard correctly leaves `test14`
+completely untouched while still fixing `test19`/`test20`.
+
+**PERF_CTRL's clear-all bit (offset `0x18`) remains a genuine, confirmed,
+deliberately-not-fixed gap.** Unlike `PERF_CNT0..3`, it isn't simply one
+of `u_perf`'s own four counter registers at a rebased offset - checked
+directly on `test19`: its `is_perf_reg` range check lumps `0x18` in with
+the four counters, so the rebase arithmetic (`0x18 - 0x08 = 0x10`) lands
+on a paddr `u_perf` doesn't recognize as anything (not one of its four
+counters, and specifically NOT its own `paddr=0` clear-all trigger) -
+nothing happens. A correct implementation needs to TRANSLATE a specific
+SoC-level control bit into a dedicated, separate write to `u_perf`'s own
+`paddr=0`, coexisting with (not conflicting with) whatever the same
+run's own `PERF_CNT` read/write wiring is already doing on the exact
+same `psel`/`paddr` port bundle - judged too easy to get subtly wrong
+generically for a safe regex fix. Prompt guidance alone got PERF_CTRL
+right on one of four tested regenerations (`test21`, full `8/8`) - real
+progress, but not a guarantee the way the three deterministic fixes are.
+
+**Verified on `test14`/`test19`/`test20` (regression + fix confirmation)
+and a further fresh, fully-automatic regeneration (`test23`, where
+`fix_perf_paddr_rebase()` fired on its own with no manual intervention)**:
+all ten categories together via `run_suite.sh` - everything unchanged
+from before, `soc_cfg_regs` now **7/8** (only `PERF_CTRL` failing,
+`PERF_CNT0..3` now reliably correct) - **90/91 passing**, one full check
+better than the previous best, with the remaining gap now precisely
+understood and honestly documented rather than a vague "not implemented."
+
 ## `mailbox` category (T1101-T1108, 12 checks) - no generator bug found; a real
 ## testbench bug caught by its own regression suite
 

@@ -90,6 +90,65 @@ path, so an inconsistent instance name breaks them even though the RTL
 itself is otherwise correct.
 """
 
+SOC_CFG_WIRING_NOTE = """
+IMPORTANT - SoC Configuration Register space (crossbar's S2 window,
+MBOX_DATA/MBOX_STATUS/PERF_CNT0-3/PERF_CTRL) correctness. These four
+specific bugs were each found via real simulation across multiple
+regenerations of this exact design - not hypothetical, all confirmed:
+1. The mailbox FIFO's wr_en input must be driven by a genuine
+   SINGLE-CYCLE PULSE, never a raw combinational level like
+   "s2_awvalid && s2_wvalid && (addr==MBOX_DATA)". A real CPU AXI4-Lite
+   master is completely free to hold awvalid/wvalid asserted for MORE
+   than one clock cycle (normal, spec-legal behavior) - the FIFO itself
+   has no edge-detection on wr_en and will silently write the SAME word
+   into the FIFO once per cycle for as long as wr_en stays high. Add an
+   explicit registered edge-detector (a 1-cycle-delayed copy of the
+   write-trigger condition, ANDed with its own logical inverse) between
+   that condition and the FIFO's actual wr_en port.
+2. The mailbox FIFO's rd_rst_n port (its independent DSP-clock-domain
+   reset) MUST be tied to sys_rst_n, exactly like wr_rst_n - never tie
+   it to a constant such as 1'b1. If rd_rst_n never actually asserts,
+   every read-side register (read pointer, synchronized gray-code
+   pointers) stays at its default uninitialized value forever,
+   permanently breaking the mailbox's entire DSP-side read interface -
+   this is NOT a "leave it disconnected for now" situation.
+3. Any registered read-response valid flag for this slave port (its own
+   rvalid output) must reliably return to 0 once the CPU master has
+   consumed the response. A common but WRONG pattern is clearing it only
+   when "(!arvalid && rready)" - a real master may only pulse rready
+   briefly around when it first observes rvalid, not hold it through a
+   later cycle where arvalid also happens to have already dropped, so
+   this condition can be missed entirely and the valid flag gets stuck
+   at 1 forever, causing every SUBSEQUENT read to silently return stale
+   data from the very first read. Instead, clear it unconditionally on
+   the same cycle rready is observed high while the flag is already set
+   (i.e. "if (rvalid_reg && rready) rvalid_reg <= 0;" as its own
+   independent clearing path, evaluated regardless of arvalid's current
+   state that cycle).
+4. PERF_CNT0/1/2/3 and PERF_CTRL (whatever SoC config offsets the
+   architecture doc assigns them) must be REAL, functional connections
+   to the perf_counter IP's own APB-style register interface (its own
+   internal address convention is FIXED and NOT the same as the SoC
+   config offsets: its own paddr=0/4/8/12 read cnt0/cnt1/cnt2/cnt3
+   respectively, and a write to its own paddr=0 clears all four) - do
+   not leave these as a stub that always returns 0 or accepts writes
+   that go nowhere. Drive the perf_counter instance's own psel/penable/
+   pwrite/paddr/pwdata whenever the SoC config address decodes into this
+   range, and return ITS real prdata output, not a locally tracked
+   placeholder value. CRITICAL: the SoC config offset for PERF_CNT0 is
+   almost certainly NOT 0x00 (e.g. the doc may assign PERF_CNT0 to SoC
+   offset 0x08) - you MUST REBASE the address before driving
+   perf_counter's own paddr port (perf_paddr = soc_offset - <the SoC
+   offset where PERF_CNT0 itself lives>, NOT the raw soc_offset passed
+   through unmodified), or you will read/write the WRONG counter (e.g.
+   passing SoC offset 0x08 straight through as perf_counter's own
+   paddr=0x08 actually hits ITS cnt2, not cnt0, since perf_counter's own
+   addressing always starts at 0 regardless of where it's mapped into
+   the larger SoC address space). Double-check this arithmetic against
+   the doc's own explicit PERF_CNT0..3/PERF_CTRL offset table before
+   finalizing.
+"""
+
 # ---------------------------------------------------------------------------
 # Strict per-IP-type YAML schema (from t19_nxp_agent_v19.py - hand-curated,
 # more complete/reliable than scraping required() calls out of gen_*.py source)
@@ -698,6 +757,78 @@ def fix_mbox_rd_rst_n(top_level_verilog):
     return top_level_verilog[:m.start()] + new_block + top_level_verilog[m.end():]
 
 
+def fix_perf_paddr_rebase(top_level_verilog):
+    """Correct a real Step-4 top-level bug, confirmed on two independent
+    regenerations (t19_hard_test19/test20) even AFTER adding explicit
+    prompt guidance about it (SOC_CFG_WIRING_NOTE point 4): `u_perf`'s
+    `paddr` port gets driven with the SoC config space's raw address
+    offset passed straight through (e.g. `{4'h0, s2_awaddr[7:0]}`), with
+    no rebasing. But `u_perf`'s own internal register convention is
+    FIXED and independent of wherever it's mapped into the larger SoC
+    address space - its own paddr=0/4/8/12 read cnt0/cnt1/cnt2/cnt3
+    respectively, always starting from 0. The architecture doc maps
+    PERF_CNT0 to SoC config offset 0x08 (not 0x00), so a raw pass-
+    through reads/writes the WRONG counter (confirmed directly: forcing
+    a real event pulse to make cnt0=1, then reading the documented
+    PERF_CNT0 SoC offset, returned 0 - because the unrebased address
+    landed on u_perf's own cnt2 instead).
+
+    Unlike the mailbox fixes, this is NOT fixed by wrapping u_perf's
+    `psel`/`penable`/`pwrite` (both observed regenerations already
+    computed those correctly) - only `paddr` needs correcting, and only
+    by a fixed, doc-derived constant offset (0x08), not something that
+    varies per run. Completely replaces `u_perf`'s `.paddr(...)`
+    connection with a fresh expression computed directly from the
+    crossbar's own guaranteed, non-inferred S2 port names
+    (`s2_awaddr`/`s2_araddr`/`s2_awvalid`), rather than trying to parse
+    and rebase whatever intermediate expression the LLM wrote - avoids
+    ever double-subtracting if a future run already gets this right.
+    """
+    m = re.search(r'u_perf\b[^;]*\([^;]*?\);', top_level_verilog, re.DOTALL)
+    if not m:
+        return top_level_verilog
+    block = m.group(0)
+    paddr_m = re.search(r'\.paddr\(\s*([^)]+?)\s*\)', block)
+    if not paddr_m:
+        return top_level_verilog
+    paddr_expr = paddr_m.group(1)
+    # Safety guard: u_perf has been seen reached through a COMPLETELY
+    # different scheme too (t19_hard_test14: an inline S1/APB-fabric
+    # slot, `psel_perf = psel && paddr[15:12]==7`, paddr fed from a
+    # plain `apb_reg_addr` wire tied to S1's OWN paddr - nothing to do
+    # with S2 at all). Blindly replacing paddr with an S2-address-
+    # derived expression there would BREAK a currently-working,
+    # unrelated addressing path by feeding it S2's irrelevant address.
+    # Only proceed if the expression feeding paddr genuinely references
+    # an s2_ signal, checking both an inline expression directly (e.g.
+    # `.paddr({4'h0, s2_awaddr[7:0]})`) and the common case of an
+    # intermediate named wire (e.g. `.paddr(perf_paddr)`) by chasing
+    # that wire's own declaration elsewhere in the file.
+    is_s2_routed = "s2_" in paddr_expr
+    if not is_s2_routed and re.match(r'^\w+$', paddr_expr):
+        decl_m = re.search(
+            rf'(?:assign\s+{re.escape(paddr_expr)}\s*=|wire(?:\s*\[[^\]]+\])?\s+{re.escape(paddr_expr)}\s*=)([^;]+);',
+            top_level_verilog)
+        if decl_m and "s2_" in decl_m.group(1):
+            is_s2_routed = True
+    if not is_s2_routed:
+        return top_level_verilog
+    FIXED_WIRE = "perf_paddr_rebased"
+    if paddr_m.group(1) == FIXED_WIRE:
+        return top_level_verilog  # already patched
+    new_block = block[:paddr_m.start()] + f".paddr({FIXED_WIRE})" + block[paddr_m.end():]
+    decl = (
+        f"wire [11:0] {FIXED_WIRE} = "
+        "{4'h0, (s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]) - 8'h08};\n    "
+    )
+    print("[FIX] Top-level: replaced u_perf's paddr connection with a "
+          "freshly-rebased expression (SoC config offset - 0x08) - the "
+          "generated address was passed straight through unrebased, "
+          "landing on the wrong counter (e.g. PERF_CNT0's documented "
+          "offset 0x08 hit u_perf's own cnt2, not cnt0).", file=sys.stderr)
+    return top_level_verilog[:m.start()] + decl + new_block + top_level_verilog[m.end():]
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
@@ -929,6 +1060,7 @@ exact module names and port definitions when instantiating them:
 Here is the Testbench Skeleton, which dictates the EXACT port contract your top-level module must use:
 {tb_skel}
 {NOC_MESH_WIRING_NOTE if mesh_path else ""}
+{SOC_CFG_WIRING_NOTE if info["problem"] == "hard" else ""}
 Task:
 1. Review the '=== LOCALLY EXTRACTED DIRECTED GRAPHS ===' section to understand the wiring: node
    descriptions explain what each block is, and edges explicitly dictate which port/IP connects
@@ -979,6 +1111,8 @@ Do not include long explanations outside the code block.
         top_level_verilog = fix_mbox_wr_en_pulse(top_level_verilog)
     if "u_mbox" in top_level_verilog:
         top_level_verilog = fix_mbox_rd_rst_n(top_level_verilog)
+    if "u_perf" in top_level_verilog:
+        top_level_verilog = fix_perf_paddr_rebase(top_level_verilog)
     if "endmodule" not in top_level_verilog:
         # No closing fence AND no endmodule = the response was truncated
         # mid-file (hit max_output_tokens before finishing), not just missing
