@@ -103,7 +103,32 @@ IP_CONSTRAINTS = """
 # AXI IPs
 - axi_lite_sram: Requires [name, depth, data_width, addr_width]
 - dma_engine: Requires [name, burst_len]
-- axi_lite_crossbar: Requires [name]
+- axi_lite_crossbar: Requires [name]. Optional: [slave_ranges] - a list of
+  exactly 3 dicts (one per slave S0/S1/S2, IN ORDER), each with keys 'base'
+  and 'size' (both integers, hex-string like "0xF0010000" is also accepted).
+  A slave's decode hits when (addr & ~(size-1)) == base - so 'size' MUST be
+  a power of 2 and 'base' MUST be aligned to it (base % size == 0).
+  THIS FIELD IS CRITICAL: if omitted, the generator silently defaults to
+  base=0x00000000/0x00010000/0x00020000 with size=0x10000 each - a generic
+  placeholder address map that will NOT match this architecture's real one
+  (found via an actual failed CPU transaction in a custom testbench, not
+  just elaboration: a write to the documented SoC-cfg address hung forever
+  because nothing decoded to it). ALWAYS derive the real base/size values
+  for S0/S1/S2 from the architecture doc's own address map table/diagram.
+  Worked example matching a real architecture doc that said "S1 (APB):
+  0xF000_0000-0xF000_FFFF", "S2 (SoC cfg): 0xF001_0000-0xF001_FFFF",
+  everything else routes to S0 (NoC):
+    slave_ranges:
+      - {base: 0x00000000, size: 0x80000000}   # S0: top address bit = 0,
+                                                 # covers every valid NoC
+                                                 # destination address
+                                                 # without overlapping S1/S2
+      - {base: 0xF0000000, size: 0x00010000}    # S1: exactly 0xF000_xxxx
+      - {base: 0xF0010000, size: 0x00010000}    # S2: exactly 0xF001_xxxx
+  Generalize this pattern (S0 = the largest power-of-2-aligned window that
+  excludes S1/S2's addresses; S1/S2 = their documented small windows) to
+  whatever base addresses THIS architecture doc actually specifies - do not
+  reuse these exact numbers if the doc's addresses differ.
 
 # NoC/Security IPs
 - tilelink_router: Requires [name, node_x, node_y, data_width, addr_width]. Optional: [num_ports]

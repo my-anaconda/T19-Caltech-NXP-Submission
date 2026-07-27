@@ -568,3 +568,87 @@ key-migration checks, 2 medium, 3 hard - the hard number includes today's
 (a Flash-tier model, priced for high-volume use). This is a small number
 in absolute terms - nowhere near a concerning spend for this much
 iteration.
+
+## Custom testbenches (no golden TB will be released) - hard tier started
+
+Since NXP has confirmed no golden TB will ever be released, started
+building our own testbenches per problem, sequenced hard-tier-first, one
+`evaluate.py` category at a time (reset_sync done; noc_local, noc_routing,
+aes_basic, dma_basic, apb_periph, irq_crypto, irq_periph, soc_cfg_regs,
+mailbox, perf_counter, integration still to come; medium and easy after
+that). Key design choice: `evaluate.py`'s own `parse_results()` just
+regexes `[PASS] T<id>` / `[FAIL] T<id>` lines out of simulation stdout
+against a fixed test-ID -> category map - so testbenches that print in
+that exact convention get scored by the evaluator's own real logic the
+moment a golden TB (or just this scoring script) is pointed at them,
+without waiting for NXP's release.
+
+New files: `custom_testbenches/hard/tb_hard_common.vh` (shared AXI4-Lite
+CPU bus-functional-model tasks - `axi_write`/`axi_read`/`pulse_reset` -
+`` `include``d by every per-category file so they all drive the CPU bus
+identically) and `tb_hard_reset_sync.v` (T101-T105, **5/5 passing** against
+the real generated hard-tier RTL). Compiled/run directly against
+`t19_hard_test4`'s output alongside the real generated `.v` files - not a
+standalone unit test, an actual `crypto_soc` integration test.
+
+Reset is only controllable via the top-level `por_n` pin (`wdt_rst_n` is
+tied internally, never exposed) - `dut.sys_rst_n` (one level below `dut`,
+not a deep/fragile reach) is used to observe the synchronizer's own output
+directly, which is necessary to verify stage-count/async-assert behaviour
+specifically rather than just downstream side effects. Tests: T101 cold
+power-up takes exactly the documented 4 cycles; T102 async-ASSERT is
+immediate (same sim instant, not clock-aligned); T103 re-triggerability
+(second pulse also takes exactly 4 cycles); T104 stability (zero glitches
+across an extended low period); T105 end-to-end integration (a real CPU
+write to MBOX_DATA actually lands, checked via the top-level `mbox_empty`
+pin - not an internal register bit, so it only depends on the documented
+port contract, not our own arbitrary implementation choices).
+
+### Two real, generalizable bugs found via this one category (not by design - found by actually simulating)
+
+1. **`axi_lite_crossbar`'s address decode was never actually configured**
+   (T105 hung forever on the first attempt: a write to the documented SoC
+   cfg address 0xF001_0000 never got a response). Root cause: the
+   generator (`gen_axi_ips.py::gen_axi_lite_crossbar`) supports a
+   `slave_ranges` YAML field to set each slave's real base/size, but
+   `IP_CONSTRAINTS` in `t19_nxp_agent_final.py` never told Step 2's
+   YAML-inference LLM this field exists (listed as `Requires [name]` only)
+   - so it always fell back to the generator's generic default map
+   (0x0000_0000/0x0001_0000/0x0002_0000), which shares NOTHING with this
+   architecture's real map (0xF000_xxxx/0xF001_xxxx). This is a gap in
+   *our own agent's* prompt schema, not a generator bug and not something
+   the mesh/router work touched - found purely because a real CPU
+   transaction was attempted and it hung, which elaboration alone could
+   never have caught (same lesson as the NoC mesh stubbing, again: only
+   real simulation catches "nothing is actually connected/configured"
+   failures). Fixed by adding a detailed `slave_ranges` entry to
+   `IP_CONSTRAINTS` with a fully worked example (concrete base/size numbers
+   matching a real doc's map, plus the reasoning for why S0's window must
+   be a power-of-2 region that excludes S1/S2's addresses). Regenerating
+   (`t19_hard_test4`) confirmed Step 2 now populates `slave_ranges` with
+   the exactly correct S1/S2 windows; S0's own window came out smaller
+   than the worked example suggested (0x1000_0000 vs 0x8000_0000) - fine
+   for this category's own test (which never routes to a remote node
+   through the CPU), but worth re-checking once the `noc_routing` category
+   needs the CPU to reach non-(0,0) nodes.
+2. **The crossbar's B/R-channel response routing is purely combinational
+   off the CURRENT master valid+address**, not a latched transaction ID -
+   so a master that drops `awvalid`/`wvalid` immediately after the AW/W
+   handshake (which real AXI4-Lite permits) makes the crossbar lose track
+   of which slave's `bvalid` to forward, and the response never arrives.
+   Found the same way - a real hang, debugged by hierarchically probing
+   `dut.s2_bvalid` (already 1) versus the top-level `cpu_bvalid` (never
+   seen 1), proving the response was generated but not routed back. Fixed
+   in `tb_hard_common.vh`'s `axi_write`/`axi_read` tasks: hold
+   `awvalid`/`wvalid` (or `arvalid`) asserted until the response is
+   actually observed, not just until the request-side handshake completes
+   - always spec-legal even where not strictly required, so this is a safe
+   BFM-side fix rather than a DUT patch.
+
+Also hit one isolated, unrelated LLM output bug in this same regeneration
+(`t19_hard_test4`): an invalid `.hready_out(s1_awvalid ? s1_wready :
+s1_arready)` - a ternary expression connected directly to an output port,
+which Verilog doesn't allow (output ports need a net, not an arbitrary
+expression). Patched locally for testing purposes (introduced an
+intermediate wire) - normal LLM-output variance, not investigated as a
+systemic issue, same category as the earlier `posedm`/`posedge` typo.
