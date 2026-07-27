@@ -24,7 +24,7 @@ TB="$(dirname "$0")"
 WORK="${TMPDIR:-/tmp}/tb_easy_suite_$$"
 mkdir -p "$WORK"
 
-for tb in tb_easy_basic_rw tb_easy_uart_tx tb_easy_gpio_irq tb_easy_timer tb_easy_watchdog tb_easy_privilege tb_easy_irq_aggregator; do
+for tb in tb_easy_basic_rw tb_easy_uart_tx tb_easy_gpio_irq tb_easy_timer tb_easy_watchdog tb_easy_privilege tb_easy_irq_aggregator tb_easy_reset_sync tb_easy_wdt_window tb_easy_irq_priority tb_easy_addr_decode tb_easy_uart_rx tb_easy_timer_pwm tb_easy_gpio_level tb_easy_wdt_unlock; do
   echo "=== $tb ==="
   iverilog -g2012 -o "$WORK/$tb.sim" -I "$TB" "$RTL"/*.v "$TB/$tb.v" > "$WORK/$tb.compile.log" 2>&1
   CEXIT=$?

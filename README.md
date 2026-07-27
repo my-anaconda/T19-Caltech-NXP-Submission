@@ -175,14 +175,34 @@ custom_testbenches/
     ├── tb_medium_noc_ns_routing.v
     ├── tb_medium_noc_2hop.v
     └── tb_medium_irq_id_order.v
+└── easy/
+    ├── run_suite.sh              ← same driver pattern, easy-tier RTL
+    ├── tb_easy_common.vh         ← adapted from the organizer's own tb_top_skeleton.v AHB tasks
+    ├── tb_easy_basic_rw.v
+    ├── tb_easy_uart_tx.v
+    ├── tb_easy_gpio_irq.v
+    ├── tb_easy_timer.v
+    ├── tb_easy_watchdog.v
+    ├── tb_easy_privilege.v
+    ├── tb_easy_irq_aggregator.v
+    ├── tb_easy_reset_sync.v
+    ├── tb_easy_wdt_window.v
+    ├── tb_easy_irq_priority.v
+    ├── tb_easy_addr_decode.v
+    ├── tb_easy_uart_rx.v
+    ├── tb_easy_timer_pwm.v
+    ├── tb_easy_gpio_level.v
+    └── tb_easy_wdt_unlock.v
 ```
 
 Usage, once you have a generated RTL output directory (e.g. from the
-`Running` steps above with `--problem hard` or `--problem medium`):
+`Running` steps above with `--problem hard`/`--problem medium`/
+`--problem easy`):
 
 ```bash
 custom_testbenches/hard/run_suite.sh   <path-to>/ICLAD26-NXP-Problems/result/<run_id>/hard
 custom_testbenches/medium/run_suite.sh <path-to>/ICLAD26-NXP-Problems/result/<run_id>/medium
+custom_testbenches/easy/run_suite.sh   <path-to>/ICLAD26-NXP-Problems/result/<run_id>/easy
 ```
 
 Each testbench targets one IP category end-to-end and reports `[PASS]`/
@@ -194,15 +214,22 @@ in the organizer's own RTL generators, this repo's own corrected `_v2`
 generators, and the Step-4 LLM-generated top-level SoC integration — each
 one root-caused against a real simulation failure and fixed, then
 reverified with a completely fresh, unpatched regeneration. Current
-status: **hard tier 96/96** across all twelve categories (one documented,
-understood gap in a rare `u_perf` wiring variant — see `NOTES.md`);
-**medium tier 50/52** across all twelve categories (one documented,
-understood Step-2 YAML-inference gap in `reset_sync`'s stage count — see
-`NOTES.md`), verified against a dev baseline with every deterministic-
-generator-backed IP regenerated fresh from the current generator
-functions, pending final confirmation against a truly fresh end-to-end
-regeneration. See `NOTES.md` for the full category-by-category bug
-writeups.
+status, all three tiers confirmed on fresh regenerations:
+
+- **hard tier: 96/96** across all twelve categories (one documented,
+  understood gap in a rare `u_perf` wiring variant).
+- **medium tier: 50/52** across all twelve categories (one documented,
+  understood Step-2 YAML-inference gap in `reset_sync`'s stage count).
+- **easy tier: 58/58** across all fifteen categories, zero known gaps —
+  a real tier-dispatch bug was found and fixed along the way
+  (`gen_irq_aggregator_v2`'s priority-order fix, correct for hard/medium,
+  was being applied unconditionally and could silently flip easy tier's
+  own opposite-convention priority order; the interception is now
+  tier-aware).
+
+**204/206** custom-testbench checks passing across all three tiers
+combined, every non-passing check fully understood and documented. See
+`NOTES.md` for the full category-by-category bug writeups.
 
 ## What's different from the starter/reference agents
 

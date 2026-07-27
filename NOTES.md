@@ -1924,7 +1924,102 @@ neatly inside a dedicated wait block.
 
 Verified via `run_suite.sh`: **basic_rw 9/9, uart_tx 4/4, gpio_irq 5/5,
 timer 5/5, watchdog 6/6, privilege 3/3, irq_aggregator 5/5 - 37/37**
-across all seven categories built so far, no known gaps. Remaining
-eight categories (`reset_sync`, `wdt_window`, `irq_priority`,
-`addr_decode`, `uart_rx`, `timer_pwm`, `gpio_level`, `wdt_unlock`) not
-yet started.
+across all seven categories built so far, no known gaps.
+
+## Easy tier complete - all 15 categories, 58/58 (2026-07-27)
+
+Finished the remaining eight categories: `reset_sync`, `wdt_window`,
+`irq_priority`, `addr_decode`, `uart_rx`, `timer_pwm`, `gpio_level`,
+`wdt_unlock`. No new generator bugs found - every remaining category
+matched its documented spec on read, confirmed via real simulation
+against `t19_easy_test4`.
+
+A few notes worth recording:
+
+- **`reset_sync`'s T803** is a genuine cross-category integration check
+  (not just this category's own unit test): drives a REAL watchdog
+  stage-2 timeout through the actual `apb_watchdog` IP and confirms it
+  reaches `reset_sync` via the documented OR-path
+  (`async_rst_n = por_n & wdt_rst_n`), reusing the same
+  event-triggered-monitor technique proven necessary in `watchdog`'s own
+  T506 (self-clearing async pulse, cycle-boundary polling insufficient).
+- **`uart_rx`** mirrors `uart_tx`'s bit-level rigor in reverse - drives a
+  real serial waveform onto the `uart_rx` pin and confirms it decodes
+  correctly through the deserializer, including FIFO-full flow control
+  (`rts_n`) and overrun detection with byte-order verification after
+  draining 17 bytes through a 16-deep FIFO.
+- **`irq_priority`** goes further than `irq_aggregator`'s own single
+  pairwise check: three real sources (UART, timer, software) added one
+  at a time, confirming the vector id climbs correctly at each step -
+  exercises the SAME "highest-index-wins" contract more exhaustively.
+- **`addr_decode`** targets the EXACT documented boundary
+  (`0x0000_4FFC` vs `0x0000_5000`, one word apart) rather than just "any
+  unmapped address", confirming the fabric's decode isn't off-by-one in
+  either direction.
+- **`wdt_window`** goes beyond `watchdog`'s own single violation check:
+  confirms a violation does NOT halt the countdown (reads directly from
+  `apb_watchdog.v`: the violation branch touches only `iqw`, never
+  `ctr`/`stage`) - the watchdog still reaches its stage-1 timeout on
+  schedule even after an early, rejected refresh attempt.
+
+Verified via `run_suite.sh` against `t19_easy_test4`: all fifteen
+categories together - **58/58**, a full clean sweep, first try on every
+one of the eight new categories.
+
+## A real, tier-specific dispatch bug found via `t19_easy_test5`
+## (2026-07-27)
+
+Ran a fresh regeneration to confirm easy tier's 58/58 end-to-end
+(`t19_easy_test5`, live `gemini-3.5-flash` call) - it immediately found
+real failures: `irq_aggregator` T703 and `irq_priority` T1002/T1003, all
+three about the SAME thing (which source wins when multiple are
+pending). Read the actual generated `irq_aggregator.v` for `test5` and
+found it carries the `"(v2 - fixed priority order)"` header and
+lowest-ID-wins encoder - i.e. it WAS routed through
+`gen_irq_aggregator_v2` this time, unlike `test4`'s identically-typed
+IP, which fell through to the organizer's original (highest-wins)
+generator.
+
+**Root cause**: `rtl_gen_from_yaml()`'s interception check
+(`if spec.get("ip_type") in (..., "irq_aggregator", ...)`) is keyed
+purely on `ip_type`, with ZERO awareness of which problem tier is being
+generated. `gen_irq_aggregator_v2` was written specifically to fix
+hard/medium's priority order (both of THOSE architecture docs say
+"lowest active source ID wins") - but easy tier's own doc says the
+OPPOSITE ("Priority encoder selects the highest pending source,
+src7=highest"), confirmed by reading its own architecture.html directly
+and already noted in this file's own "easy tier started" section above.
+Since the interception fires whenever Step 2's YAML inference happens to
+write the exact string `irq_aggregator` (which it doesn't do
+*consistently* - `test4`'s inference apparently produced something that
+didn't match, `test5`'s did), this is a **real, silent correctness bug**
+for the easy tier specifically: roughly half of easy regenerations would
+ship with the WRONG priority convention for their own documented spec,
+and nothing in the pipeline would have caught it without a testbench
+that actually exercises the multi-source-pending case (both
+`irq_aggregator` and `irq_priority` do).
+
+**Fix**: `rtl_gen_from_yaml()` now takes a `problem` parameter (threaded
+through from `info["problem"]` at the call site) and excludes
+`irq_aggregator` from the intercepted-ip-type set specifically when
+`problem == "easy"` - every other intercepted ip_type (router, SRAM, NI,
+AES, APB fabric, perf counter) has no tier-specific behavior difference,
+so this is the one place tier-awareness is actually needed. Verified the
+fix doesn't affect hard/medium (both still `problem != "easy"`, the v2
+fix still applies exactly as before).
+
+**Verified via a further fresh regeneration (`t19_easy_test6`, fix
+applied)**: `irq_aggregator.v`'s header no longer carries the
+`"(v2 - fixed priority order)"` tag - confirming it now consistently
+routes through the organizer's original (correct-for-easy) generator -
+and `run_suite.sh` confirms the full **58/58** across all fifteen
+categories, `irq_aggregator`/`irq_priority` included.
+
+**Three-tier summary at this point**: hard **96/96** (12/12 categories,
+one documented gap), medium **50/52** (12/12 categories, one documented
+gap, confirmed on a fresh regeneration), easy **58/58**, confirmed on
+TWO fresh regenerations (`test4` before the fix was ever needed,
+`test6` after fixing the real tier-dispatch bug found via `test5`) -
+15/15 categories, zero known gaps. **204/206** custom-testbench checks
+passing across all three tiers combined, every non-passing check fully
+understood and documented.

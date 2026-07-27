@@ -977,11 +977,28 @@ def fix_perf_event0_wiring(top_level_verilog):
     return top_level_verilog[:m.start()] + new_block + top_level_verilog[m.end():]
 
 
-def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
+def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir, problem=None):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric", "irq_aggregator", "perf_counter"):
+    # irq_aggregator's v2 fix is intentionally EXCLUDED here for the easy
+    # tier: gen_irq_aggregator_v2 rewrites the priority encoder to
+    # "lowest ID wins" (correct for hard/medium tier - both of THOSE
+    # architecture docs say "lowest active source ID") but easy tier's
+    # own doc says the OPPOSITE ("Priority encoder selects the highest
+    # pending source, src7=highest"). A real regression was found this
+    # way: t19_easy_test4 happened to fall through to the organizer's
+    # original (correct-for-easy) generator, but t19_easy_test5's
+    # identical ip_type spec DID match this interception and silently
+    # flipped easy's priority order to the wrong convention - confirmed
+    # directly by reading the generated irq_aggregator.v's own priority-
+    # encoder logic in each case. The interception has no other
+    # problem-specific behavior (hard/medium both want the v2 fix), so
+    # this is the one place tier-awareness is actually needed.
+    intercept_types = ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric", "perf_counter")
+    if problem != "easy":
+        intercept_types = intercept_types + ("irq_aggregator",)
+    if spec.get("ip_type") in intercept_types:
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -1161,7 +1178,7 @@ Task:
     print("[STEP3] Generating IP RTL from YAML specs...", file=sys.stderr)
     generated_files = []
     for yaml_path in yaml_paths:
-        generated_files.extend(rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir))
+        generated_files.extend(rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir, problem=info["problem"]))
     print(f"[STEP3] Total generated: {len(generated_files)} file(s)", file=sys.stderr)
 
     expected_ips = EXPECTED_IPS_BY_PROBLEM.get(info["problem"], [])
