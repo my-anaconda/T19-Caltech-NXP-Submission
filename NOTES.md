@@ -652,3 +652,86 @@ which Verilog doesn't allow (output ports need a net, not an arbitrary
 expression). Patched locally for testing purposes (introduced an
 intermediate wire) - normal LLM-output variance, not investigated as a
 systemic issue, same category as the earlier `posedm`/`posedge` typo.
+
+## `noc_local` category (T201-T206) - four more real bugs, all now fixed
+
+Building the very next category (`custom_testbenches/hard/tb_hard_noc_local.v`
+- CPU write/read to its own co-located node (0,0) SRAM through the FULL real
+stack: crossbar -> NI -> router -> SRAM, not the router-only unit tests from
+earlier) surfaced four more genuine bugs, on top of the two from
+`reset_sync`. None of these were guesses - every one was root-caused from an
+actual stuck/wrong simulation, several requiring `$monitor`/hierarchical
+probing across the crossbar/NI/router boundary to pin down.
+
+1. **`gen_router_v2.py`'s own local-write completion condition was wrong**
+   (T201 first attempt: write DATA correctly landed in SRAM, yet the router
+   never advanced past `S_SEND` - permanently wedging itself and blocking
+   every later transaction). Root cause: `if (sram_awready && sram_wready)
+   st<=S_WAIT;` assumes the SRAM asserts both simultaneously, but
+   `gen_sram_v2`'s (and the original generator's) protocol is strictly
+   two-phase - `awready` pulses for the address phase, `wready` pulses
+   separately for the data phase, NEVER together. The SRAM's own retry
+   behavior (re-triggering off the router's continuously-held `awvalid`)
+   is what let the DATA land despite the router being stuck - a red
+   herring that could easily have been mistaken for "it works." Fixed
+   with `aw_seen`/`w_seen` latches that independently remember each phase
+   as it completes, advancing once BOTH have been seen on ANY cycle (not
+   necessarily the same one); `sram_awvalid`/`sram_wvalid` now also drop
+   independently once each phase's own ready is seen, instead of both
+   dropping together only once the router leaves `S_SEND`.
+2. **The generated top-level left the crossbar's unused M1 (DMA config
+   bus) port half tied-off**: the response side (`dma_m_awready`,
+   `dma_m_bvalid`, etc.) was tied to safe idle values, but the
+   request side (`dma_m_awvalid`, `dma_m_arvalid`, `dma_m_wvalid`, etc.)
+   was left completely floating. Icarus doesn't flag it, so the effect
+   only showed up as `s0_awvalid`/`s0_arvalid` intermittently reading `'x'`
+   once the crossbar's round-robin `rr`/`rr_rd` registers advanced past
+   their reset value - corrupting a LATER transaction from the CPU (M0)
+   despite M0 itself driving clean values throughout. Confirms the same
+   lesson as always: `'x'` silently poisons downstream shared logic rather
+   than erroring. Patched locally for this test; added a new, general
+   Step-4 prompt rule (not tied to any specific IP) requiring BOTH
+   directions of any unused master/slave port to be tied off, with this
+   exact incident as the worked example.
+3. **`gen_tilelink_ni`'s own `axi_bvalid`/`axi_rvalid` formulas have a
+   genuine off-by-one race**: `assign axi_bvalid = (st==S_IDLE) &&
+   is_write && tl_d_valid && ...;` requires BOTH "I have already left
+   S_WAIT" AND "the router's reply is still asserted" in the same cycle -
+   but the router drops its reply in the exact same edge that NI leaves
+   S_WAIT (both sides transition simultaneously, triggered by the same
+   handshake), so `tl_d_valid` has necessarily already dropped by the
+   cycle where `st` first reads as `S_IDLE`. The condition can
+   structurally never be satisfied under real timing. (The FIRST
+   `noc_local` write only appeared to complete earlier because bug #2's
+   `'x'` corruption made `cpu_bvalid` read as `'x'`, and `while(!x)` reads
+   as false in Verilog - a false pass masking this real bug underneath.)
+   Fixed in `gen_ni_v2.py` (`gen_tilelink_ni_v2`): check the response
+   while STILL in `S_WAIT` (the same cycle `tl_d_ready` is unconditionally
+   1), not after already having left it.
+4. **`gen_tilelink_ni`'s `axi_awready` was gated on the wrong, STALE
+   register**: `axi_awready = (st==S_IDLE) && axi_awvalid && !is_write;`
+   - `is_write` reflects the PREVIOUS transaction's type and is never
+   reset, so after any write, `!is_write` reads `0` forever, permanently
+   blocking every SUBSEQUENT write's own AW handshake (reads were
+   unaffected, since `axi_arready` never references `is_write`). Found via
+   T204 (back-to-back writes): the first write of the pair hung forever
+   even though the router/SRAM/M1 fixes above were all already in place
+   and NI was correctly sitting in `S_IDLE`. Fixed in the same
+   `gen_ni_v2.py`: `axi_awready` now matches `axi_wready`'s own (correct)
+   condition - accept whenever BOTH awvalid and wvalid are present,
+   regardless of the last transaction's type.
+
+After all four fixes: `tb_hard_noc_local.v` passes clean, **6/6**
+(`NOC_LOCAL SCORE: 6/6`), and re-running `tb_hard_reset_sync.v` against the
+same regenerated RTL confirms no regression (**5/5** still). New file:
+`agent/rtl_gen_lib_ext/gen_ni_v2.py`. Wired into the agent the same way as
+the router/SRAM fixes (`rtl_gen_from_yaml` now also intercepts `ip_type:
+tilelink_ni`).
+
+This category alone found more real bugs than `reset_sync` did, entirely
+because it's the first test to exercise a CPU transaction through the
+*complete* crossbar->NI->router->SRAM chain rather than one piece at a
+time - a strong argument for continuing this same "build one category,
+actually run it, chase every real failure to its root cause" approach
+rather than writing all remaining categories' testbenches speculatively
+before running any of them.

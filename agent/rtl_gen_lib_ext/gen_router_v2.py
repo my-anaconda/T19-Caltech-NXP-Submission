@@ -126,6 +126,20 @@ module {n} #(
     reg [2:0]  r_size;
     reg [3:0]  r_source;
     reg [63:0] r_data;
+    // The local SRAM's own AXI4-Lite slave (gen_sram_v2.py) implements a
+    // strictly SEQUENTIAL two-phase write protocol - awready pulses first
+    // (address phase), wready pulses later (data phase), and it NEVER
+    // asserts both in the same cycle (verified: this is exactly what
+    // caused a real, reproducible hang - the router got permanently stuck
+    // in S_SEND for every local write, since `sram_awready && sram_wready`
+    // is never true, even though the write's DATA still landed in SRAM
+    // because the SRAM itself kept re-triggering off the router's
+    // continuously-held awvalid - only the router's own FSM was wedged,
+    // silently blocking every subsequent transaction). aw_seen/w_seen
+    // latch each phase independently as it completes, so the SEND->WAIT
+    // transition fires once both have been observed, on whichever cycles
+    // they actually occur.
+    reg aw_seen, w_seen;
 
     wire any_in = loc_a_valid | p0_s_a_valid | p1_s_a_valid | p2_s_a_valid | p3_s_a_valid;
 
@@ -164,6 +178,7 @@ module {n} #(
             st <= S_IDLE; origin <= 3'd0; dest_sel <= 3'd0;
             o_opcode<=0; o_param<=0; o_size<=0; o_source<=0; o_addr<=0; o_mask<=0; o_data<=0;
             r_opcode<=0; r_param<=0; r_size<=0; r_source<=0; r_data<=0;
+            aw_seen<=1'b0; w_seen<=1'b0;
         end else begin
             case (st)
                 S_IDLE: if (any_in) begin
@@ -184,6 +199,7 @@ module {n} #(
                         o_source<=loc_a_source; o_addr<=loc_a_addr; o_mask<=loc_a_mask; o_data<=loc_a_data;
                     end
                     dest_sel <= go_local ? 3'd0 : go_east ? 3'd3 : go_west ? 3'd4 : go_north ? 3'd1 : 3'd2;
+                    aw_seen <= 1'b0; w_seen <= 1'b0;
                     st <= S_SEND;
                 end
                 S_SEND: begin
@@ -191,7 +207,12 @@ module {n} #(
                         3'd0: if (o_opcode == 3'd4) begin
                                   if (sram_arready) st <= S_WAIT;
                               end else begin
-                                  if (sram_awready && sram_wready) st <= S_WAIT;
+                                  // aw_seen/w_seen latch each phase as it
+                                  // completes (see declaration comment) -
+                                  // sram_awready/wready never coincide.
+                                  if (sram_awready) aw_seen <= 1'b1;
+                                  if (sram_wready) w_seen <= 1'b1;
+                                  if ((sram_awready || aw_seen) && (sram_wready || w_seen)) st <= S_WAIT;
                               end
                         3'd1: if (p0_m_a_ready) st <= S_WAIT;
                         3'd2: if (p1_m_a_ready) st <= S_WAIT;
@@ -243,8 +264,8 @@ module {n} #(
                         sram_araddr = o_addr; sram_arvalid = (st==S_SEND);
                         sram_rready = (st==S_WAIT);
                     end else begin // PutFullData -> write
-                        sram_awaddr = o_addr; sram_awvalid = (st==S_SEND);
-                        sram_wdata = o_data[DATA_W-1:0]; sram_wstrb = o_mask; sram_wvalid = (st==S_SEND);
+                        sram_awaddr = o_addr; sram_awvalid = (st==S_SEND) && !aw_seen;
+                        sram_wdata = o_data[DATA_W-1:0]; sram_wstrb = o_mask; sram_wvalid = (st==S_SEND) && !w_seen;
                         sram_bready = (st==S_WAIT);
                     end
                 end

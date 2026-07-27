@@ -83,7 +83,11 @@ n{{X}}{{Y}}_* ports are AXI4-Lite slaves, so this is a direct master-to-slave
 connection). Every node's n{{X}}{{Y}}_* port that has no real external master
 driving it must be tied idle exactly like any other unused AXI4-Lite slave
 port in this design (awvalid=0, wvalid=0, arvalid=0, bready=1'b1,
-rready=1'b1).
+rready=1'b1). Name this instance EXACTLY "u_noc_mesh" (i.e. write
+`noc_mesh u_noc_mesh ( ... );`, not e.g. `noc_mesh noc_mesh ( ... );`) -
+custom testbenches probe into this instance by that fixed hierarchical
+path, so an inconsistent instance name breaks them even though the RTL
+itself is otherwise correct.
 """
 
 # ---------------------------------------------------------------------------
@@ -500,7 +504,7 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram"):
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni"):
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -517,9 +521,12 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
         if spec["ip_type"] == "tilelink_router":
             from gen_router_v2 import gen_tilelink_router_v2
             files = gen_tilelink_router_v2(spec)
-        else:
+        elif spec["ip_type"] == "axi_lite_sram":
             from gen_sram_v2 import gen_axi_lite_sram_v2
             files = gen_axi_lite_sram_v2(spec)
+        else:
+            from gen_ni_v2 import gen_tilelink_ni_v2
+            files = gen_tilelink_ni_v2(spec)
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
         generated = []
@@ -722,6 +729,16 @@ Task:
 5. Your top-level ports MUST match the testbench skeleton exactly.
 6. Use only Verilog 2001 constructs (iverilog -g2005 compatible). No $clog2 in non-synthesis
    context - compute bit widths directly.
+7. If any IP has a master or slave port that this design does not actually use (e.g. an
+   axi_lite_crossbar master port with no real driver), you MUST tie off BOTH directions of it -
+   every valid/request signal driven INTO it (e.g. awvalid/wvalid/arvalid - tie to 0) AND every
+   ready/ready-like signal driven OUT of it that a real master would need to supply (e.g.
+   bready/rready - tie to 1). Found via a real hang in a custom testbench (not elaboration -
+   Icarus does not flag an undriven wire as an error, it silently reads as 'x' and can corrupt
+   unrelated shared logic like round-robin arbitration): a prior generation correctly tied off
+   the crossbar's OUTPUT side of an unused master port but forgot the INPUT side entirely,
+   leaving it floating - this silently corrupted OTHER masters' own transactions once the
+   crossbar's internal round-robin state advanced past its initial value.
 
 Output STRICTLY the complete, synthesizable Verilog code inside one ```verilog ... ``` block.
 Do not include long explanations outside the code block.
