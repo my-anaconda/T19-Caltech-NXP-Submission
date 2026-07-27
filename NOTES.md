@@ -1826,3 +1826,32 @@ only non-passing checks, exactly as expected and understood. Not yet
 verified against a truly fresh end-to-end regeneration (blocked on a
 working API key at the time of this pass) - that remains the next step
 before this can be called as fully confirmed as hard tier's 96/96.
+
+**Confirmed on a genuinely fresh regeneration (`t19_medium_test4`,
+real `gemini-3.5-flash` call, new API key)**: exact same **50/52**
+result, with two extra findings:
+
+1. **The SRAM handshake fix (Bug 1) is proven end-to-end, not just
+   against the manually-patched dev baseline** - `t19_medium_test4`'s
+   OWN live-model-generated `u_sram_00.v` (from the now-fixed
+   `gen_axi_lite_sram_v2`) correctly completes T105's local write, no
+   manual patching involved.
+2. **A second real naming-variability bug, same class as `noc_mesh`'s**:
+   this regeneration named `u_rst`'s `sys_rst_n` output wire `rst_n` at
+   the `noc_aes_soc.v` top level - despite the architecture doc's own
+   diagram explicitly labeling that exact signal `sys_rst_n` - breaking
+   every testbench's `dut.sys_rst_n` hierarchical reference (compile
+   error, not a silent pass). Fixed the same way `run_suite.sh` already
+   handles `noc_mesh`'s instance-name variability: auto-detect the real
+   wire name from `.sys_rst_n(...)`'s connection in `noc_aes_soc.v` and
+   substitute it into a working copy of each testbench before compiling.
+3. **The STAGES gap (Bug 3) is now confirmed real and recurring, not a
+   one-off**: `test3` had `STAGES=3`, this fresh `test4` came out
+   `STAGES=2` - a DIFFERENT wrong value each time, both against the
+   doc's own 4-FF diagram. Genuinely non-deterministic Step-2 inference,
+   not a fixed generator default being silently reused - still not
+   fixed (would need dedicated prompt-guidance work, verified against
+   its own further regenerations, not started this pass).
+
+Medium tier's real-regeneration score: **50/52**, matching the dev
+baseline exactly, both non-passing checks fully understood.

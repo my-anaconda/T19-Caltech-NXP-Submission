@@ -5,7 +5,11 @@
 # run_suite.sh, including the same noc_mesh instance-name auto-detect
 # (Step 4's top-level generation doesn't always call it "u_noc_mesh"
 # despite prompt guidance - see the hard-tier script for the full
-# rationale).
+# rationale). Also auto-detects the internal wire name Step 4 chose for
+# u_rst's own sys_rst_n output - a fresh regeneration (t19_medium_test4)
+# named it "rst_n" instead, despite the architecture doc's own diagram
+# explicitly labeling that exact signal "sys_rst_n" - the same class of
+# cosmetic-but-testbench-breaking naming variability as noc_mesh's.
 #
 # Usage: run_suite.sh <path-to-generated-RTL-dir>
 #   e.g. run_suite.sh /path/to/ICLAD26-NXP-Problems/result/<run_id>/medium
@@ -28,8 +32,15 @@ if [ -z "$MESH_INST" ]; then
 fi
 echo "[HARNESS] Detected noc_mesh instance name: $MESH_INST"
 
+RST_WIRE=$(grep -oE '\.sys_rst_n\([A-Za-z_][A-Za-z0-9_]*\)' "$RTL/noc_aes_soc.v" | head -1 | sed -E 's/\.sys_rst_n\(([A-Za-z_][A-Za-z0-9_]*)\)/\1/')
+if [ -z "$RST_WIRE" ]; then
+  echo "[WARN] Could not detect u_rst's sys_rst_n wire name in $RTL/noc_aes_soc.v - defaulting to sys_rst_n"
+  RST_WIRE="sys_rst_n"
+fi
+echo "[HARNESS] Detected sys_rst_n wire name: $RST_WIRE"
+
 for tb in tb_medium_reset_sync tb_medium_noc_topology tb_medium_aes0_encrypt tb_medium_aes1_encrypt tb_medium_irq_agg tb_medium_sram_ni_idle tb_medium_noc_ni_basic tb_medium_noc_local_loop tb_medium_noc_ew_routing tb_medium_noc_ns_routing tb_medium_noc_2hop tb_medium_irq_id_order; do
-  sed "s/u_noc_mesh/$MESH_INST/g" "$TB/$tb.v" > "$WORK/$tb.v"
+  sed -e "s/u_noc_mesh/$MESH_INST/g" -e "s/dut\.sys_rst_n/dut.$RST_WIRE/g" "$TB/$tb.v" > "$WORK/$tb.v"
   echo "=== $tb ==="
   iverilog -g2005 -o "$WORK/$tb.sim" -I "$TB" "$RTL"/*.v "$WORK/$tb.v" > "$WORK/$tb.compile.log" 2>&1
   CEXIT=$?
