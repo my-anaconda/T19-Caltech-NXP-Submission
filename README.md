@@ -15,6 +15,8 @@ T19-Caltech-NXP-Submission/
 │   └── t19_nxp_agent_final.py   ← the submission agent
 ├── scripts/
 │   └── model_service.py         ← local Gemini Developer API proxy, for testing
+├── custom_testbenches/
+│   └── hard/                    ← self-authored hard-tier testbench suite (see below)
 ├── requirements.txt
 ├── NOTES.md                     ← design rationale / version comparison
 └── README.md                    ← this file
@@ -131,6 +133,50 @@ model name honors this - "lite"/"latest"-alias model names
 (`gemini-3.5-flash-lite`, `gemini-flash-latest`, etc.) rejected the explicit
 `thinking_config` outright with a 400 error during testing; `gemini-3.5-flash`
 accepts it. Keep this in mind if you swap in a different model server/config.
+
+## `custom_testbenches/` — self-authored hard-tier verification suite
+
+The `hard` tier's golden testbench is not released to participants (same as
+`easy`/`medium`, see the limitation noted above), so local runs normally
+can't confirm anything beyond elaboration. To get real functional coverage
+before submission, this repo includes a from-scratch testbench suite —
+`custom_testbenches/hard/` — that exercises every hard-tier IP category
+against *actual iverilog/vvp simulation*, not just compilation:
+
+```
+custom_testbenches/hard/
+├── run_suite.sh              ← driver: runs all 11 testbenches against one RTL output dir
+├── tb_hard_common.vh         ← shared clock/reset/timeout/scoreboard macros
+├── tb_hard_reset_sync.v
+├── tb_hard_noc_local.v
+├── tb_hard_noc_routing.v
+├── tb_hard_aes_basic.v
+├── tb_hard_dma_basic.v
+├── tb_hard_apb_periph.v
+├── tb_hard_irq_crypto.v
+├── tb_hard_perf_counter.v
+├── tb_hard_irq_periph.v
+├── tb_hard_soc_cfg_regs.v
+└── tb_hard_mailbox.v
+```
+
+Usage, once you have a generated `hard`-tier RTL output directory (e.g. from
+the `Running` steps above with `--problem hard`):
+
+```bash
+custom_testbenches/hard/run_suite.sh <path-to>/ICLAD26-NXP-Problems/result/<run_id>/hard
+```
+
+Each testbench targets one IP category end-to-end (reset/clock-domain
+synchronization, NoC local/routing, AES, DMA, APB peripherals, crypto IRQs,
+performance counters, peripheral IRQs, SoC config-space registers, and the
+mailbox) and reports `[PASS]`/`[FAIL]` per check. This suite is how the real
+bugs described in `NOTES.md` were actually found — in both the organizer's
+own RTL generators and the Step-4 LLM-generated top-level SoC integration —
+each one root-caused against a real simulation failure and fixed, then
+reverified with a completely fresh, unpatched regeneration. Current status:
+**91/91 checks passing** across all eleven hard-tier categories on a fresh
+regeneration. See `NOTES.md` for the category-by-category bug writeups.
 
 ## What's different from the starter/reference agents
 
