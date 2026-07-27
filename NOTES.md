@@ -1469,3 +1469,60 @@ all ten categories together via `run_suite.sh` - `reset_sync` (5/5),
 `irq_periph` (7/7), `soc_cfg_regs` (6/8, the 2 confirmed-not-fixed
 `PERF_CNT`/`PERF_CTRL` checks) - **77/79 passing** consistently across
 all three.
+
+## `mailbox` category (T1101-T1108, 12 checks) - no generator bug found; a real
+## testbench bug caught by its own regression suite
+
+Unlike every category so far, reading `gen_async_fifo` (in
+`gen_primitives.py`) before writing any testbench code did NOT turn up an
+obvious bug: it's a textbook-correct Cummings-style dual-clock FIFO -
+gray-code write/read pointers, the standard MSB-inverted comparison for
+full detection (`wr_gray == {~rdg2[PBITS-1:PBITS-2], rdg2[PBITS-3:0]}`),
+matching `PBITS = ABITS+1` binary/gray tracking on both sides, and a
+plain combinational `dout = mem[rd_bin[ABITS-1:0]]` read. `soc_cfg_regs`'s
+own testbench already covers the CPU-facing register CONTRACT around the
+mailbox (and found real top-level bugs there - `mbox_wr_en`/`rd_rst_n`);
+this category is scoped differently, force/release-ing `u_mbox`'s own
+`wr_en`/`din` ports directly (bypassing whatever top-level SoC-cfg wiring
+a given run has) to stress-test the FIFO IP itself under real dual-clock
+CDC (`clk`=10ns, `dsp_clk`=14ns period - genuinely asynchronous, no
+common multiple within any reasonably-sized test window).
+
+**Found one real bug - in this testbench itself, not the generator.**
+T1105 (confirming a pop while genuinely empty is safely ignored)
+force/release's `dut.u_mbox.rd_en` directly, but the first draft never
+released it - so it stayed forced to 0 for the rest of the simulation,
+silently overriding every LATER `mbox_pop` call's real `rd_en` pulse
+(driven procedurally through the normal `mbox_rd_en` top-level port).
+`rd_bin` never advanced again after that point, and every subsequent pop
+returned the exact same stale first word - caught immediately by T1106
+(wraparound stress), which failed on effectively every iteration after
+the first. This is exactly the kind of bug this suite's own "test
+everything for real, don't assume" methodology exists to catch, even
+when it turns out to be self-inflicted - fixed with the missing
+`release`.
+
+With that one line fixed, all 12 checks pass cleanly, and re-confirms
+`gen_async_fifo` has no bug of its own to fix here: real single-word
+round-trips, FIFO ordering (not LIFO) across multiple words, filling to
+exactly `DEPTH` (16) asserting `full` at precisely the right count (not
+off-by-one either direction), a push while genuinely full being safely
+dropped with no data corruption, a pop while genuinely empty being
+safely ignored with no pointer corruption, 40 push/pop cycles crossing
+the internal circular-buffer wraparound point multiple times with exact
+data integrity preserved, and a batch of 16 back-to-back same-cycle
+writes (maximum write-side throughput stress) drained correctly and in
+order from the fully asynchronous read side.
+
+Tests: T1101 single push/pop round-trip; T1102a-c FIFO ordering across
+three words; T1103 `full` asserts at exactly `DEPTH`; T1104 a push while
+full is safely dropped, and draining afterward shows no corruption or
+phantom word; T1105 a pop while empty leaves `rd_bin` untouched; **T1106
+the key wraparound-stress test**; T1107 back-to-back fast writes drain
+correctly under full CDC stress; T1108 clean idle steady-state.
+
+**Verified end-to-end on a fresh regeneration (`t19_hard_test18`) and on
+`test11_verify`**: all eleven categories together via `run_suite.sh` -
+every prior category unchanged, plus `mailbox` (12/12) - **89/91
+passing** (the 2 non-passing checks being the same confirmed, documented
+`PERF_CNT`/`PERF_CTRL` gap from `soc_cfg_regs`, not anything new here).
