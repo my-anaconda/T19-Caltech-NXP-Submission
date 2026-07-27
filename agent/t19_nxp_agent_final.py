@@ -607,6 +607,97 @@ def fix_perf_counter_hier_ref(top_level_verilog):
     return fixed
 
 
+def fix_mbox_wr_en_pulse(top_level_verilog):
+    """Correct a real Step-4 top-level bug: whatever drives `u_mbox`'s
+    `wr_en` port (the architecture doc's own REQUIRED internal wire name
+    for this signal is `mbox_wr_en` - "write-enable from SoC config reg
+    into async mailbox") behaves as a LEVEL that can stay high for more
+    than one clock cycle, not a single-cycle pulse. `gen_async_fifo`'s
+    write logic has no edge-detection (`if (wr_en && !full) ...
+    wr_bin<=wr_bin+1;` - a plain level check, by design, matching every
+    other simple write-enable in this codebase) - it faithfully writes
+    once per clock cycle for as long as wr_en stays high. Confirmed via a
+    real trace: a single logical CPU write held awvalid/wvalid for two
+    clock cycles (completely normal, spec-legal AXI4-Lite master
+    behavior, the same "hold through bvalid" pattern already required
+    elsewhere in this SoC - see tb_hard_common.vh's own axi_write), and
+    the resulting level pushed the SAME word into the mailbox TWICE.
+
+    This has been observed generated THREE structurally different ways
+    across regenerations - a plain `assign mbox_wr_en = expr;`, an inline
+    `wire mbox_wr_en = expr;`, and (t19_hard_test16) a clocked `reg` that
+    still re-asserts to 1 every cycle its own trigger condition holds
+    (registered, but not edge-limited - the same underlying bug in a
+    different shape). Rather than keep chasing new syntactic forms of
+    the SOURCE expression, this fixes it at the one place guaranteed to
+    exist regardless of source style: `u_mbox`'s own `.wr_en(...)` port
+    connection. Whatever currently feeds that port is wrapped in a fresh
+    edge-detector and the connection is redirected to the edge-detected
+    result - safe and idempotent even if a future run's `mbox_wr_en`
+    already happens to be a proper single-cycle pulse (edge-detecting an
+    already-single-cycle pulse just re-derives the same pulse).
+    """
+    m = re.search(r'u_mbox\b[^;]*\([^;]*?\);', top_level_verilog, re.DOTALL)
+    if not m:
+        return top_level_verilog
+    block = m.group(0)
+    wr_en_m = re.search(r'\.wr_en\(\s*([^)]+?)\s*\)', block)
+    if not wr_en_m:
+        return top_level_verilog
+    orig_expr = wr_en_m.group(1)
+    if orig_expr == "mbox_wr_en_pulse":
+        return top_level_verilog  # already patched
+    new_block = block[:wr_en_m.start()] + ".wr_en(mbox_wr_en_pulse)" + block[wr_en_m.end():]
+    pulse_logic = (
+        "reg mbox_wr_en_prev;\n"
+        "    always @(posedge clk or negedge sys_rst_n)\n"
+        "        if (!sys_rst_n) mbox_wr_en_prev <= 1'b0;\n"
+        f"        else mbox_wr_en_prev <= ({orig_expr});\n"
+        f"    wire mbox_wr_en_pulse = ({orig_expr}) & ~mbox_wr_en_prev;\n    "
+    )
+    print("[FIX] Top-level: wrapped u_mbox's wr_en connection in a fresh "
+          "single-cycle edge-detector - whatever currently drives it "
+          "behaves as a level that can stay high for more than one clock "
+          "cycle (a CPU master legally holding awvalid/wvalid through "
+          "bvalid), which was silently pushing the same word into the "
+          "mailbox multiple times.", file=sys.stderr)
+    return top_level_verilog[:m.start()] + pulse_logic + new_block + top_level_verilog[m.end():]
+
+
+def fix_mbox_rd_rst_n(top_level_verilog):
+    """Correct a real, serious Step-4 top-level bug (t19_hard_test15):
+    `u_mbox`'s `rd_rst_n` port tied to a constant `1'b1` (with the LLM's
+    own comment "// Async reset not explicitly tied"), instead of
+    `sys_rst_n`. Since gen_async_fifo's entire read-side register file
+    (`rd_bin`, `rd_gray`, `rdg1`, `rdg2`) only ever initializes inside
+    `if (!rd_rst_n) ...` - and `rd_rst_n` never once deasserts-then-stays-
+    permanently-1 the way a real reset does, it just IS 1 from time 0 -
+    every read-side register starts at Verilog's default uninitialized
+    'x' and stays there forever, permanently breaking `mbox_empty`/
+    `mbox_dout`/`mbox_rd_en` (confirmed via a real trace: every read-side
+    signal reads 'x' throughout the whole simulation). This is a direct,
+    unambiguous architecture-doc violation - the doc states plainly
+    "wr_rst_n and rd_rst_n both = sys_rst_n" - and both `u_mbox` (the
+    required instance name) and `rd_rst_n` (the generator's own fixed
+    port name) are guaranteed, not LLM-inferred, so this is corrected
+    deterministically within the `u_mbox` instantiation specifically
+    (never touching any OTHER reset signal elsewhere in the design).
+    """
+    m = re.search(r'u_mbox\b[^;]*\([^;]*?\);', top_level_verilog, re.DOTALL)
+    if not m:
+        return top_level_verilog
+    block = m.group(0)
+    new_block, n = re.subn(r'\.rd_rst_n\(\s*[^)]+\)', '.rd_rst_n(sys_rst_n)', block)
+    if n == 0 or new_block == block:
+        return top_level_verilog
+    print("[FIX] Top-level: forced u_mbox's rd_rst_n port to sys_rst_n - "
+          "it was tied to a constant (never actually resetting), leaving "
+          "every read-side register permanently 'x' and the mailbox's "
+          "entire DSP-side interface non-functional. The doc requires "
+          "'wr_rst_n and rd_rst_n both = sys_rst_n'.", file=sys.stderr)
+    return top_level_verilog[:m.start()] + new_block + top_level_verilog[m.end():]
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
@@ -884,6 +975,10 @@ Do not include long explanations outside the code block.
         top_level_verilog = fix_ahb_bridge_hprot(top_level_verilog)
     if "u_cnt" in top_level_verilog:
         top_level_verilog = fix_perf_counter_hier_ref(top_level_verilog)
+    if "mbox_wr_en" in top_level_verilog:
+        top_level_verilog = fix_mbox_wr_en_pulse(top_level_verilog)
+    if "u_mbox" in top_level_verilog:
+        top_level_verilog = fix_mbox_rd_rst_n(top_level_verilog)
     if "endmodule" not in top_level_verilog:
         # No closing fence AND no endmodule = the response was truncated
         # mid-file (hit max_output_tokens before finishing), not just missing

@@ -1341,3 +1341,131 @@ this is a genuine top-level bug (not a testbench race) by trying an
 actively-`while(!cpu_rvalid)`-waiting read, which captured the identical
 stale value. Both `t19_hard_test11`/`test14` show no such issue -
 run-dependent Step-4 top-level flakiness, tracked but not blocking.
+
+## `soc_cfg_regs` category (T1001-T1008) - two real, fixed top-level bugs, two
+## confirmed-but-unfixable gaps
+
+Unlike every category so far, the SoC Config Register Map (doc-documented
+base `0xF001_0000`: `MBOX_DATA`/`MBOX_STATUS`/`PERF_CNT0..3`/`PERF_CTRL`/
+reserved) has no dedicated `rtl_gen_lib` generator at all - Step 4 hand-
+writes the entire S2 decode directly into the top-level every run, and
+its structure varies enormously (confirmed structurally different across
+FOUR separate regenerations in this pass alone). `tb_hard_soc_cfg_regs.v`
+tests this register CONTRACT against the real, documented address, via
+the plain shared `axi_write`/`axi_read` BFM (this address space's own
+ack timing turned out to be simple, standard registered handshakes -
+no fused-ack workaround needed).
+
+**Bug #1, found empirically (T1002/T1004/T1005 all failed on the first
+real run, `t19_hard_test14`).** Whatever drives `u_mbox`'s `wr_en` port -
+the doc's own REQUIRED internal wire name for it is `mbox_wr_en`,
+"write-enable from SoC config reg into async mailbox" - behaves as a
+LEVEL that can stay high for more than one clock cycle. Since `axi_write`
+(like every BFM in this suite) holds awvalid/wvalid through bvalid -
+completely normal, spec-legal AXI4-Lite behavior, required elsewhere in
+this same SoC's own crossbar - and `gen_async_fifo`'s write logic has no
+edge-detection either (a plain level check, by design, matching every
+other simple write-enable in this codebase), a SINGLE logical CPU write
+pushed the SAME word into the mailbox TWICE (confirmed directly: `wr_bin`
+incremented to 2 after exactly one `axi_write` call). This was observed
+generated THREE structurally different ways across regenerations - a
+plain `assign mbox_wr_en = expr;`, an inline `wire mbox_wr_en = expr;`,
+and (`t19_hard_test16`) a clocked `reg` that still re-asserts to 1 every
+cycle its own trigger condition holds (registered, but not edge-limited -
+the same bug in a different shape). Rather than keep chasing new
+syntactic forms of the SOURCE expression, `fix_mbox_wr_en_pulse()` fixes
+it at the one place guaranteed to exist regardless of source style:
+`u_mbox`'s own `.wr_en(...)` port connection is rewrapped in a fresh
+edge-detector, safe and idempotent even if a future run's `mbox_wr_en`
+already happens to be a proper pulse.
+
+**Bug #2, found on `t19_hard_test15`, more serious than bug #1.**
+`u_mbox`'s `rd_rst_n` port was tied to a constant `1'b1` (with the LLM's
+own comment *"// Async reset not explicitly tied"*), instead of
+`sys_rst_n`. Since `gen_async_fifo`'s entire read-side register file
+(`rd_bin`/`rd_gray`/`rdg1`/`rdg2`) only initializes inside
+`if (!rd_rst_n) ...`, and `rd_rst_n` never once deasserts - it just IS 1
+from time 0, permanently - every read-side register starts at Verilog's
+default uninitialized `x` and stays there forever, breaking
+`mbox_empty`/`mbox_dout` completely (confirmed via a real trace: every
+read-side signal read `x` throughout the entire simulation, T1001
+onward). This is a direct, unambiguous architecture-doc violation - the
+doc states plainly *"wr_rst_n and rd_rst_n both = sys_rst_n"* - and both
+`u_mbox` (the required instance name) and `rd_rst_n` (the generator's
+own fixed port name) are guaranteed, not LLM-inferred, so fixed
+deterministically with `fix_mbox_rd_rst_n()`, scoped specifically to the
+`u_mbox` instantiation (never touching any other reset signal in the
+design).
+
+**Gap #1, NOT fixed, confirmed identically on two separate regenerations
+(`test14`/`test15`): `PERF_CNT0..3`/`PERF_CTRL` (`0x08..0x18`) are simply
+never implemented in the S2 decode at all** - every read falls through
+to a `default: s2_rdata_reg <= 32'b0;`, and a write is acked (`s2_bvalid`
+fires) but goes nowhere. `u_perf` IS real and correctly instantiated in
+both runs, just reachable at a completely different, undocumented
+address (an inline `paddr[15:12]==7` slot in the S1/APB fabric window)
+instead of through S2 at all. Unlike `mbox_wr_en`/`rd_rst_n`, there is no
+single guaranteed wire or port name to regex against here - the S2
+block's overall shape (which offsets it even attempts, and how) varies
+too much across regenerations to fix safely and generically.
+
+**Gap #2, NOT fixed, and confirmed RECURRING (not a one-off) across two
+separate regenerations (`t19_hard_test16` and `t19_hard_test17`).** Both
+runs' S2 read-response state machine (`s2_rvalid_reg`/`s2_rvalid_r` -
+the exact internal name varies, the bug doesn't) only clears its
+registered valid flag on `!s2_awvalid && s2_rready`, but the shared
+`axi_read` BFM only pulses `cpu_rready` briefly around each transaction
+(correct, standard AXI4-Lite master behavior) - so once the FIRST read
+completes, the internal rvalid register gets stuck at 1 permanently, and
+every SUBSEQUENT read silently returns the FIRST read's stale captured
+data forever after (confirmed via a real trace on `test16`: `s2_rvalid`
+never dropped back to 0 for the rest of the simulation; independently
+re-confirmed on `test17`, where it fully explains all four of that run's
+remaining `soc_cfg_regs` failures - T1002/T1004/T1005/T1006/T1007 are
+ALL reads issued after T1001, the first one, and all four return
+T1001's stale "empty=1" snapshot). The internal rvalid register is a
+purely-internal, non-guaranteed name with no doc-mandated identity, and
+its surrounding clear-condition logic is too structurally embedded in
+each run's own larger always-block to safely target with an isolated,
+low-risk regex the way `mbox_wr_en`/`rd_rst_n` could be (those were
+single port connections; this is a multi-line clocked FSM woven into
+unrelated read-mux logic). Both gaps documented here rather than
+force-fixed, same treatment as the DMA-config-bus gap.
+
+**One testbench-only timing lesson, the same class already seen twice
+this session:** `mbox_read`'s `mbox_rd_en` pulse was originally set
+immediately after the `while (mbox_empty) @(posedge dsp_clk);` loop
+exited - the same same-edge race already found and fixed for
+`tb_hard_perf_counter.v`'s `event_N` stimulus (changing a DUT input
+right after `@(posedge X)` races that SAME edge's own active-region
+convergence). Fixed by moving the change to `@(negedge dsp_clk)`
+instead, giving a full half-period of guaranteed settling margin.
+
+Tests: T1001/T1004 `MBOX_STATUS` correctly reflects empty before/after a
+real push+drain cycle; **T1002 the key mbox_wr_en double-write test**;
+T1003 a pushed word is correctly retrievable via the real DSP-side
+interface (`mbox_rd_en`/`mbox_dout`, `dsp_clk` domain - proving the
+SoC-config write path reaches real FIFO storage, not just a status bit);
+T1005 filling the mailbox to its real depth (16) sets the full bit;
+T1006/T1007 the confirmed, documented `PERF_CNT`/`PERF_CTRL` gap; T1008 a
+reserved offset reads 0.
+
+**Verified across five independent regenerations in total**: `test14`
+(bug #1's discovery), `test15` (bug #2's discovery, plus re-confirming
+bug #1's fix), `test16` (gap #2's discovery, plus re-confirming both
+fixes with the finalized port-based `mbox_wr_en` approach), and `test17`
+(a further completely fresh, fully-automatic agent run - independently
+hit gap #2 again, which on inspection fully explains all its remaining
+`soc_cfg_regs` failures with no other regression, confirming gap #2 is a
+genuine, recurring LLM tendency rather than a one-off - `mbox_wr_en_pulse`
+was itself confirmed correctly auto-inserted by `fix_mbox_wr_en_pulse()`,
+verified absent from the raw pre-fix LLM response and present in the
+final file). The clean, all-bugs-fixed confirmation numbers below come
+from `test14`/`test15`/`test16` (each with both fixes applied, either
+automatically or via a scratch copy using the exact same fix functions):
+all ten categories together via `run_suite.sh` - `reset_sync` (5/5),
+`noc_local` (6/6), `noc_routing` (10/10), `aes_basic` (8/8), `dma_basic`
+(10/10), `apb_periph` (6/6), `irq_crypto` (10/10), `perf_counter` (9/9),
+`irq_periph` (7/7), `soc_cfg_regs` (6/8, the 2 confirmed-not-fixed
+`PERF_CNT`/`PERF_CTRL` checks) - **77/79 passing** consistently across
+all three.
