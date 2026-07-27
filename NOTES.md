@@ -1610,3 +1610,130 @@ correctly under full CDC stress; T1108 clean idle steady-state.
 every prior category unchanged, plus `mailbox` (12/12) - **89/91
 passing** (the 2 non-passing checks being the same confirmed, documented
 `PERF_CNT`/`PERF_CTRL` gap from `soc_cfg_regs`, not anything new here).
+
+## `integration` category (T1201-T1205, 5 checks) - the twelfth and final
+## hard-tier category, plus two more real top-level bugs found
+
+Every prior category exercises one IP block/subsystem in isolation, mostly
+via force/release. `integration` deliberately does the opposite: it chains
+multiple already-proven subsystems together through REAL top-level wiring,
+to catch bugs invisible to any single-category unit test - the same way
+the router-stubbing and `mbox_wr_en`-pulse bugs earlier this session were
+both only found once something drove the real end-to-end path. Five
+checks, new file `custom_testbenches/hard/tb_hard_integration.v`:
+
+- **T1201** cold-boot-to-first-transaction: one real access into each of
+  the three crossbar-decoded regions (S0 NoC, S1 APB, S2 SoC-cfg),
+  back-to-back, right after the minimum post-reset settle margin every
+  other category also uses.
+- **T1202** dual-aggregator independence: a real AES0 done pulse and a
+  real GPIO0 edge-IRQ fired close together - checks BOTH `cpu_crypto_irq`
+  and `cpu_periph_irq` assert correctly and independently, no cross-talk
+  between the two separate aggregator instances.
+- **T1203** the doc's explicit fan-out claim ("aes_done ... OR-fed to
+  irq_crypto_src[0..3] AND perf ch[3]") - one real aes1 done pulse must
+  reach BOTH consumers from the SAME physical event.
+- **T1204** a full software-driven chain: CPU programs a REMOTE
+  (multi-hop) DMA transfer, waits for the real IRQ, then (the "software
+  response") pushes the transferred value through the real SoC-cfg
+  mailbox path and confirms the DSP side reads it back - NoC + DMA + IRQ
+  + mailbox CDC all in one continuous, causally-linked sequence.
+- **T1205** perf ch[0]'s doc-mandated real-traffic filter ("ch[0] = ni_00
+  tl_a_valid, NoC transactions from CPU") - unlike `tb_hard_perf_
+  counter.v` (which forces `event_0` directly), this drives one real NoC
+  transaction, one real APB transaction, and one real SoC-cfg-space
+  transaction and checks `cnt0` increased by exactly 1.
+
+**A subtlety worth calling out**: `evaluate.py`'s own `parse_results()`
+keys results purely by the NUMERIC id (`re.match(r'\[(PASS|FAIL)\]\s+T(\d+)'
+, ...)`), so suffixed ids like `T1201a`/`T1201b` would both collapse onto
+id 1201 and silently discard all but the last result - caught before ever
+running this against real RTL, by re-reading the evaluator's own regex
+first. Every check in this file combines its sub-conditions with `&&` into
+exactly one `T120N` id instead.
+
+**First real run (`t19_hard_test25`, a fresh, fully-automatic
+regeneration) found T1203 and T1205 failing** - two NEW real top-level
+bugs, both in `u_perf`'s wiring, neither previously seen:
+
+1. **`event_0` tied to a flat constant.** The generated comment admitted
+   it: *"Unused directly inside integrated noc_mesh, but we can feed
+   1'b0 or pull from a safe logic level"*. Root cause: `try_stitch_
+   noc_mesh()` hides the individual `u_ni_XY`/`u_router_XY` instances (and
+   their internal TileLink signals) from Step 4's prompt entirely - there
+   is no internal NI signal for the LLM to reach for ch[0] even in
+   principle, so it (reasonably, given what it can see) fell back to a
+   constant. Fixed via new `fix_perf_event0_wiring()`: the crossbar's own
+   guaranteed S0 port handshake (`s0_awvalid && s0_awready`, `s0_arvalid
+   && s0_arready`) fires exactly once per real CPU-initiated NoC
+   transaction accepted at node (0,0) - the same node `ni_00`/`router_00`
+   sit at - so it's a functionally equivalent, always-visible substitute
+   that doesn't require exposing any new mesh port. Chases ONE level of
+   indirection (the common `.event_0(perf_ev0)` + `wire perf_ev0 = 1'b0;`
+   pattern, confirmed exactly on test25) and only fires when the resolved
+   expression is a flat constant - deliberately narrow, so it never
+   overwrites a regeneration that already wires something real in.
+
+2. **`u_perf`'s `paddr` reached through TWO hops of indirection** -
+   `.paddr(perf_paddr)` with `wire [11:0] perf_paddr = {4'h0,
+   (soc_reg_offset - 8'h08)};` and `soc_reg_offset` ITSELF declared as
+   `s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]` elsewhere. Genuinely
+   S2-routed, just one hop further than `fix_perf_paddr_rebase()`'s
+   existing one-level chase reached - deepened to a bounded-depth-3
+   recursive chase (comfortably covers this and the original case).
+
+   **A second, more fundamental bug was found while debugging #2**: the
+   function that locates `u_perf`'s own instantiation block
+   (`re.search(r'u_perf\b[^;]*\([^;]*?\);', ...)`) was too loose - this
+   regeneration has a comment ("...the internal paddr of u_perf (0x08 ->
+   0x00, ...)") that CONTAINS the literal text "u_perf (" and appears
+   BEFORE the real instantiation in the file, so the old regex matched
+   that comment fragment first and silently no-op'd BOTH perf fixes with
+   no error at all (confirmed directly: re-ran both fixes in isolation
+   against the raw Step-4 response text, both reported no change, until
+   this was found). Anchored on the actual instantiation syntax
+   (`u_perf\s+u_perf\s*\(` - module name then instance name, standard
+   Verilog) instead, which cannot match a prose comment.
+
+   Both fixes verified together: patched `test25`'s already-generated
+   `crypto_soc.v` in isolation first (91/91 -> confirmed both `[FIX]`
+   messages fire, `run_suite.sh` goes from 94/96 to **96/96**), then
+   regression-checked `test24` and `test14` (both report "no change" -
+   `test24` because its paddr was already correctly patched by the
+   original one-hop fix and the idempotency guard correctly no-ops on an
+   already-fixed expression, `test14` because its APB-inline paddr still
+   correctly never traces to `s2_` at any hop).
+
+**A THIRD structural variant, found on a second fresh regeneration
+(`t19_hard_test27`), is deliberately left unfixed.** This one reaches
+`u_perf` through `.paddr(psel_perf ? paddr[11:0] : perf_paddr)` - a MUX
+between a test14-style inline S1/APB-fabric slot (`psel_perf = psel &&
+paddr[15:12]==7`) AND a separate S2-derived path, with `perf_paddr` itself
+assigned procedurally inside an `always` block (not a plain `wire`/`assign`,
+so the current chase doesn't even resolve it). Blindly replacing
+`.psel`/`.paddr` here risks breaking the S1 branch exactly the way the
+existing guard was built to protect `test14`'s single-path case - not
+safe to fix with the same blunt "take full ownership" approach. When this
+variant occurs, T1203/T1205 here and T1006/T1007 in `soc_cfg_regs` fail
+together, consistently, for the same understood reason - documented as an
+accepted gap rather than chased into an ever-more-specific regex (this
+area has now shown THREE distinct real structural variants across
+regenerations: pure-S2 single-hop, pure-S2 two-hop, pure-S1-inline, and
+now S1+S2-mixed - diminishing returns on chasing a fourth).
+
+**`t19_hard_test26` (the fresh regeneration attempted between test25 and
+test27) hit an unrelated one-off LLM typo** (`.m_m_awvalid(...)` instead
+of `.m_awvalid(...)` in `u_dma1`'s own instantiation, a doubled-word
+copy-paste error) that failed elaboration entirely before any testbench
+could run - not connected to anything touched this session, not
+previously seen, and (being a single one-off character-level typo rather
+than a recurring structural pattern) not treated as worth a dedicated
+regex fix the way the recurring bugs above were.
+
+**Net result**: T1201/T1202/T1204 pass reliably on every regeneration
+tested (`test24`/`test25`/`test27`). T1203/T1205 pass when `u_perf` is
+S2-routed (directly, one-hop, or two-hop) and fail together with
+`soc_cfg_regs`' own T1006/T1007 on the rarer S1+S2-mixed variant - by
+design tracking, not masking, that pre-existing documented gap.
+`t19_hard_test25` (fully patched): **96/96** across all twelve
+categories.

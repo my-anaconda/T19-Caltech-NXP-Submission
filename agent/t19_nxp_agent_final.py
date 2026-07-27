@@ -802,7 +802,16 @@ def fix_perf_paddr_rebase(top_level_verilog):
     principle use an exclusive upper bound that excludes 0x18 entirely,
     silently never asserting psel for a PERF_CTRL write at all.
     """
-    m = re.search(r'u_perf\b[^;]*\([^;]*?\);', top_level_verilog, re.DOTALL)
+    # Anchored on the actual instantiation syntax ("u_perf u_perf (" - module
+    # name then instance name then the port-list's opening paren), not just
+    # a bare "u_perf" followed eventually by a "(" - t19_hard_test25 has a
+    # comment ("...the internal paddr of u_perf (0x08 -> 0x00, ...)") that a
+    # looser pattern latches onto FIRST (it appears earlier in the file),
+    # matching a useless few-word fragment up to that comment line's own
+    # semicolon instead of the real instantiation - silently no-oping both
+    # perf fixes with no error, confirmed via direct inspection of exactly
+    # this failure on that regeneration.
+    m = re.search(r'u_perf\s+u_perf\s*\([^;]*?\);', top_level_verilog, re.DOTALL)
     if not m:
         return top_level_verilog
     block = m.group(0)
@@ -822,13 +831,32 @@ def fix_perf_paddr_rebase(top_level_verilog):
     # `.paddr({4'h0, s2_awaddr[7:0]})`) and the common case of an
     # intermediate named wire (e.g. `.paddr(perf_paddr)`) by chasing
     # that wire's own declaration elsewhere in the file.
-    is_s2_routed = "s2_" in paddr_expr
-    if not is_s2_routed and re.match(r'^\w+$', paddr_expr):
-        decl_m = re.search(
-            rf'(?:assign\s+{re.escape(paddr_expr)}\s*=|wire(?:\s*\[[^\]]+\])?\s+{re.escape(paddr_expr)}\s*=)([^;]+);',
-            top_level_verilog)
-        if decl_m and "s2_" in decl_m.group(1):
-            is_s2_routed = True
+    # t19_hard_test25 turned up a THIRD structural variant this one-level
+    # chase doesn't reach: `.paddr(perf_paddr)` where `perf_paddr` is
+    # computed from an intermediate `soc_reg_offset` wire (itself
+    # `s2_awvalid ? s2_awaddr[7:0] : s2_araddr[7:0]`) - genuinely S2-routed,
+    # just two hops of indirection away instead of one. Chase bounded-depth
+    # (3 hops - comfortably covers this and the original 1-hop case) through
+    # every intermediate wire's own declaration, not just the first one.
+    def _chase_s2_routed(expr, depth=3, seen=None):
+        if seen is None:
+            seen = set()
+        if "s2_" in expr:
+            return True
+        if depth <= 0:
+            return False
+        for ident in set(re.findall(r'\b[A-Za-z_]\w*\b', expr)):
+            if ident in seen:
+                continue
+            seen.add(ident)
+            decl_m = re.search(
+                rf'(?:assign\s+{re.escape(ident)}\s*=|wire(?:\s*\[[^\]]+\])?\s+{re.escape(ident)}\s*=)([^;]+);',
+                top_level_verilog)
+            if decl_m and _chase_s2_routed(decl_m.group(1), depth - 1, seen):
+                return True
+        return False
+
+    is_s2_routed = _chase_s2_routed(paddr_expr)
     if not is_s2_routed:
         return top_level_verilog
     FIXED_PADDR = "perf_paddr_rebased"
@@ -858,6 +886,95 @@ def fix_perf_paddr_rebase(top_level_verilog):
           "write (bit1) was never redirected to u_perf's own paddr=0 "
           "clear-all trigger.", file=sys.stderr)
     return top_level_verilog[:m.start()] + decl + new_block + top_level_verilog[m.end():]
+
+
+def fix_perf_event0_wiring(top_level_verilog):
+    """Fix a real Step-4 top-level bug, found via `tb_hard_integration.v`'s
+    T1205 on a fresh regeneration (`t19_hard_test25`): `u_perf`'s
+    `event_0` port (documented as "ch[0] = ni_00 tl_a_valid, NoC
+    transactions from CPU") tied to a flat constant instead of any real
+    signal, with a generated comment admitting it: "Unused directly
+    inside integrated noc_mesh, but we can feed 1'b0 or pull from a safe
+    logic level". Root cause: `try_stitch_noc_mesh()` hides the
+    individual `u_ni_XY`/`u_router_XY` instances (and their internal
+    TileLink signals) from Step 4's prompt entirely - it only ever sees
+    the one clean `noc_mesh` header exposing per-node AXI4-Lite ports -
+    so there is no internal NI signal for the LLM to reach for ch[0] even
+    in principle, and it (reasonably, given what it can see) fell back to
+    a constant.
+
+    Fix: the crossbar's own guaranteed S0 port handshake
+    (`s0_awvalid && s0_awready`, `s0_arvalid && s0_arready`) fires
+    exactly once per real CPU-initiated NoC transaction accepted at node
+    (0,0) - the same node ni_00/router_00 sit at - so it is a functionally
+    equivalent, always-visible substitute for "ni_00 tl_a_valid" that
+    doesn't require exposing any new internal mesh signal. Only replaces
+    `event_0` when it (or, following ONE level of indirection through a
+    named wire - the common case, e.g. `.event_0(perf_ev0)` with `wire
+    perf_ev0 = 1'b0;` elsewhere - confirmed on t19_hard_test25) resolves
+    to a flat constant (`1'b0`/`1'd0`/`0`/`1'b1`) - a deliberately narrow,
+    unambiguous trigger, so this never overwrites a regeneration that
+    already wires something real (even if not this exact expression)
+    into event_0.
+    """
+    # Anchored on the actual instantiation syntax ("u_perf u_perf (" - module
+    # name then instance name then the port-list's opening paren), not just
+    # a bare "u_perf" followed eventually by a "(" - t19_hard_test25 has a
+    # comment ("...the internal paddr of u_perf (0x08 -> 0x00, ...)") that a
+    # looser pattern latches onto FIRST (it appears earlier in the file),
+    # matching a useless few-word fragment up to that comment line's own
+    # semicolon instead of the real instantiation - silently no-oping both
+    # perf fixes with no error, confirmed via direct inspection of exactly
+    # this failure on that regeneration.
+    m = re.search(r'u_perf\s+u_perf\s*\([^;]*?\);', top_level_verilog, re.DOTALL)
+    if not m:
+        return top_level_verilog
+    block = m.group(0)
+    ev0_m = re.search(r'\.event_0\(\s*([^)]+?)\s*\)', block)
+    if not ev0_m:
+        return top_level_verilog
+    ev0_expr = ev0_m.group(1)
+
+    def _is_flat_const(expr):
+        expr = expr.strip()
+        return bool(re.match(r"^1'[bBdD]?[01]$", expr)) or expr in ("0", "1")
+
+    # t19_hard_test25's actual pattern is one hop of indirection:
+    # `.event_0(perf_ev0)` with `wire perf_ev0 = 1'b0;` declared
+    # elsewhere - chase through a single named-wire indirection (same
+    # bounded, conservative approach as fix_perf_paddr_rebase's s2_ chase)
+    # so the fix still finds and replaces the constant at its real
+    # declaration site, leaving the port connection's own wire name intact.
+    decl_target = None  # None = patch the port connection itself
+    if _is_flat_const(ev0_expr):
+        pass
+    elif re.match(r'^\w+$', ev0_expr):
+        decl_m = re.search(
+            rf'(?:assign\s+{re.escape(ev0_expr)}\s*=|wire(?:\s*\[[^\]]+\])?\s+{re.escape(ev0_expr)}\s*=)([^;]+);',
+            top_level_verilog)
+        if decl_m and _is_flat_const(decl_m.group(1)):
+            decl_target = decl_m
+        else:
+            return top_level_verilog
+    else:
+        return top_level_verilog
+
+    if "s0_awvalid" not in top_level_verilog or "s0_arvalid" not in top_level_verilog:
+        # No guaranteed S0 handshake names found (unexpected top-level
+        # structure) - nothing safe to wire event_0 to instead.
+        return top_level_verilog
+    FIXED_EXPR = "((s0_awvalid && s0_awready) || (s0_arvalid && s0_arready))"
+    print("[FIX] Top-level: u_perf's event_0 was tied to a flat constant "
+          "(perf ch[0] would never count) - rewired to the crossbar's own "
+          "S0 AXI handshake, a real per-transaction pulse at the CPU's "
+          "NoC entry node.", file=sys.stderr)
+    if decl_target is not None:
+        # Rewrite the intermediate wire's own declaration RHS in place,
+        # leaving `.event_0(perf_ev0)` (or whatever it's named) untouched.
+        start, end = decl_target.start(1), decl_target.end(1)
+        return top_level_verilog[:start] + f" {FIXED_EXPR}" + top_level_verilog[end:]
+    new_block = block[:ev0_m.start()] + f".event_0({FIXED_EXPR})" + block[ev0_m.end():]
+    return top_level_verilog[:m.start()] + new_block + top_level_verilog[m.end():]
 
 
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
@@ -1144,6 +1261,7 @@ Do not include long explanations outside the code block.
         top_level_verilog = fix_mbox_rd_rst_n(top_level_verilog)
     if "u_perf" in top_level_verilog:
         top_level_verilog = fix_perf_paddr_rebase(top_level_verilog)
+        top_level_verilog = fix_perf_event0_wiring(top_level_verilog)
     if "endmodule" not in top_level_verilog:
         # No closing fence AND no endmodule = the response was truncated
         # mid-file (hit max_output_tokens before finishing), not just missing

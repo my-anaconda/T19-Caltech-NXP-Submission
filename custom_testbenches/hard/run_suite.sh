@@ -35,7 +35,7 @@ if [ -z "$MESH_INST" ]; then
 fi
 echo "[HARNESS] Detected noc_mesh instance name: $MESH_INST"
 
-for tb in tb_hard_reset_sync tb_hard_noc_local tb_hard_noc_routing tb_hard_aes_basic tb_hard_dma_basic tb_hard_apb_periph tb_hard_irq_crypto tb_hard_perf_counter tb_hard_irq_periph tb_hard_soc_cfg_regs tb_hard_mailbox; do
+for tb in tb_hard_reset_sync tb_hard_noc_local tb_hard_noc_routing tb_hard_aes_basic tb_hard_dma_basic tb_hard_apb_periph tb_hard_irq_crypto tb_hard_perf_counter tb_hard_irq_periph tb_hard_soc_cfg_regs tb_hard_mailbox tb_hard_integration; do
   sed "s/u_noc_mesh/$MESH_INST/g" "$TB/$tb.v" > "$WORK/$tb.v"
   echo "=== $tb ==="
   iverilog -g2005 -o "$WORK/$tb.sim" -I "$TB" "$RTL"/*.v "$WORK/$tb.v" > "$WORK/$tb.compile.log" 2>&1
