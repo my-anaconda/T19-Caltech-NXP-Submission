@@ -865,3 +865,78 @@ start) to confirm full automation - this run happened to infer
 `0x80000000` correctly on its own (further confirming the
 non-determinism), so the auto-fix correctly no-op'd, and all **29/29**
 tests passed again with zero manual intervention either way.
+
+## `dma_basic` category (T501-T510) - a real top-level wiring gap, and a general NI protocol bug
+
+Checked the architecture doc first, since the earlier reset_sync category
+already established that the crossbar's M1 port is "the DMA config bus"
+(CPU programs `SRC_ADDR`/`DST_ADDR`/`LENGTH`/`CTRL` through it, per the
+doc's own text) - unlike AES, which the doc explicitly calls out as
+"standalone", DMA's config path is *supposed* to be CPU-reachable.
+Checked the actual generated top-level (`t19_hard_test8`): M1's own
+request-side signals are tied to a hardcoded `0`, and separately each
+DMA engine's `cfg_*` port is ALSO tied to constants - the documented
+CPU->M1->DMA-config path isn't wired at all. Worth noting: this is likely
+partly a side effect of this session's OWN earlier tie-off prompt
+guidance ("tie off any unused master/slave port") - M1 isn't actually
+unused here, and the LLM appears to be defaulting to the safe/idle
+pattern rather than wiring it to the real DMA config ports. Flagged as a
+known, still-open top-level wiring gap (not fixed in this pass - the
+value here was in DIRECTLY testing what IS real and working: the DMA
+engine's own master port, which the doc says drives the router's inject
+port directly at nodes (0,1)/(0,2), IS correctly wired into the real NoC
+mesh). `tb_hard_dma_basic.v` exercises the DMA engines via `force`/
+`release` on their own `cfg_*` ports (same rationale as `aes_basic` -
+bypass the missing path, test the real engine + its real mesh
+connection), which is honest about testing what's actually there while
+still exercising the DMA<->router<->SRAM path for real.
+
+**First run: 3/10, and the failures pointed at a THIRD real bug in
+`gen_tilelink_ni_v2`** (on top of the two already fixed there). The
+`dma_engine` generator's own master port asserts `AWVALID` and `WVALID`
+on genuinely SEPARATE cycles - `S_WR_ADDR` asserts only `m_awvalid`,
+`S_WR_DATA` (a later state) asserts only `m_wvalid` - a fully decoupled
+AXI4-Lite master, which is completely valid AXI4-Lite behaviour, just
+different from the CPU BFM used everywhere else in this testbench suite
+(which happens to always assert both together). Fix #2 from the
+`noc_local` work (`axi_awready = (st==S_IDLE) && axi_awvalid &&
+axi_wvalid`) still implicitly required BOTH channels valid in the SAME
+cycle - correct for the CPU's own pattern, but this permanently stalls
+any master that presents them one at a time, exactly the same class of
+bug already fixed once in the ROUTER's own local-SRAM-write path
+(`aw_seen`/`w_seen`, see the `noc_local` section) - just not yet applied
+to the NI. Fixed the same way: `aw_seen`/`w_seen` now latch each
+channel's own handshake independently in `gen_ni_v2.py`, so either
+simultaneous or fully-decoupled AW/W presentation works. **All 10/10
+passing after the fix**, and re-ran the full existing suite (all 39
+tests across `reset_sync`/`noc_local`/`noc_routing`/`aes_basic`/
+`dma_basic` together) to confirm the CPU path still works unaffected -
+it does.
+
+Tests: T501/T506 config register write/readback on each engine; T502/
+T507 a real local transfer (preloaded via the already-proven CPU NoC
+path, moved by the DMA engine itself through its own real router
+connection at its inject node); T503 the FSM returns to
+`dma_st==0` (per the doc's own required-name callout) once done; T504
+`dma_irq` stays low without `CTRL[1]` (irq_en) even though the transfer
+completed; T505/T508 `dma_irq` correctly feeds `irq_crypto` src[4]/src[5]
+respectively (two DIFFERENT ids, confirming distinct wiring for both
+engines); T509 idle stability (neither engine spuriously re-triggers
+after both have completed); T510 a genuinely REMOTE DMA-initiated
+transfer (node (0,1) -> node (2,0), multiple hops), proving the DMA
+engine's own traffic gets correctly forwarded through the mesh exactly
+like CPU traffic does.
+
+**Verified end-to-end on yet another fresh, fully unpatched regeneration
+(`t19_hard_test9`, all fixes wired in from the start)**: all five
+categories together via `run_suite.sh` - `reset_sync` (5/5), `noc_local`
+(6/6), `noc_routing` (10/10), `aes_basic` (8/8), `dma_basic` (10/10) -
+**39/39 passing**, zero manual RTL edits.
+
+**Still open** (tracked, not blocking): the CPU->M1->DMA-config wiring
+gap noted above. Since the DMA engine itself and its real mesh
+connection are now both proven correct via direct force-based testing,
+this is purely a top-level-integration gap, isolated the same way the
+NoC-mesh-stubbing gap was earlier in this project - worth a dedicated
+prompt-guidance pass later, but not necessary for continuing to the
+remaining categories.

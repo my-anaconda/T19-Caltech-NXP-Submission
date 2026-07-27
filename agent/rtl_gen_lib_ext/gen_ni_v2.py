@@ -34,8 +34,24 @@ back to 0 after a write completes. So after any write, every subsequent
 write's own AW handshake is permanently blocked (`!is_write` reads as
 `!1` = 0 forever) - reads are unaffected since `axi_arready` never
 references `is_write`. Fixed to match `axi_wready`'s own (correct)
-condition: accept a new write whenever both awvalid AND wvalid are
-present, regardless of what the last transaction happened to be.
+condition at the time: accept a new write whenever both awvalid AND
+wvalid are present, regardless of what the last transaction happened
+to be.
+
+Fix #3 (found via the dma_basic category - the dma_engine generator's
+own master port asserts AWVALID and WVALID on genuinely SEPARATE
+cycles, a fully decoupled AXI4-Lite master, unlike the CPU BFM used
+elsewhere which happens to assert both together): fix #2's condition
+still implicitly required BOTH channels valid in the SAME cycle, so it
+worked for the CPU path but permanently stalled a master that presents
+them one at a time - `m_awvalid` alone during dma_engine's own S_WR_ADDR
+state is never joined by `m_wvalid` until a LATER cycle (S_WR_DATA), by
+which point `m_awvalid` itself has already dropped. `aw_seen`/`w_seen`
+now latch each channel's own handshake independently (mirroring the same
+fix already applied to the router's local-SRAM-write path for the same
+underlying reason - a downstream module presenting two logically-linked
+signals across separate cycles), so the S_IDLE capture logic accepts
+either simultaneous or fully-decoupled AW/W presentation correctly.
 """
 from gen_utils import hdr as _hdr
 
@@ -88,13 +104,28 @@ module {n} #(
     reg [1:0] st;
     reg [ADDR_W-1:0] r_addr; reg [DATA_W-1:0] r_wdata;
     reg [MASK_W-1:0] r_mask; reg is_write;
+    // Fix #3 (see module docstring): aw_seen/w_seen latch each write
+    // channel's handshake independently, so a master that presents
+    // AWVALID and WVALID on SEPARATE cycles (fully decoupled channels -
+    // legal AXI4-Lite master behaviour, and exactly what the dma_engine
+    // generator's own master port does) is captured correctly, not just
+    // a master that happens to assert both simultaneously (like the CPU
+    // BFM used elsewhere in this testbench, which is what fix #2 alone
+    // was implicitly assuming).
+    reg aw_seen, w_seen;
+    reg [ADDR_W-1:0] aw_capture;
+    reg [DATA_W-1:0] w_capture;
+    reg [MASK_W-1:0] wstrb_capture;
 
     // Fixed: no longer gated on the stale `is_write` register from the
-    // PREVIOUS transaction (see module docstring, fix #2) - matches
-    // axi_wready's own condition.
-    assign axi_awready = (st==S_IDLE) && axi_awvalid && axi_wvalid;
-    assign axi_wready  = (st==S_IDLE) && axi_wvalid && axi_awvalid;
-    assign axi_arready = (st==S_IDLE) && axi_arvalid && !axi_awvalid;
+    // PREVIOUS transaction (see module docstring, fix #2) - and no
+    // longer requires the OTHER channel simultaneously (fix #3): each
+    // channel is independently accepted once, latched, and the S_IDLE
+    // capture below combines whichever values are live this cycle with
+    // whichever were already latched on an earlier cycle.
+    assign axi_awready = (st==S_IDLE) && axi_awvalid && !aw_seen;
+    assign axi_wready  = (st==S_IDLE) && axi_wvalid && !w_seen;
+    assign axi_arready = (st==S_IDLE) && axi_arvalid && !axi_awvalid && !aw_seen && !w_seen;
     // Fixed: check the response while STILL in S_WAIT (same cycle
     // tl_d_ready is unconditionally 1 below), not after already leaving
     // it - see module docstring for why st==S_IDLE here never fires.
@@ -114,13 +145,19 @@ module {n} #(
     assign tl_d_ready  = (st==S_WAIT) || axi_bready || axi_rready;
 
     always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin st<=S_IDLE; r_addr<=0; r_wdata<=0; r_mask<=0; is_write<=0; end
-        else case(st)
+        if (!rst_n) begin
+            st<=S_IDLE; r_addr<=0; r_wdata<=0; r_mask<=0; is_write<=0;
+            aw_seen<=0; w_seen<=0; aw_capture<=0; w_capture<=0; wstrb_capture<=0;
+        end else case(st)
             S_IDLE: begin
-                if (axi_awvalid && axi_wvalid) begin
-                    r_addr<=axi_awaddr; r_wdata<=axi_wdata; r_mask<=axi_wstrb;
-                    is_write<=1; st<=S_SEND;
-                end else if (axi_arvalid && !axi_awvalid) begin
+                if (axi_awvalid && axi_awready) begin aw_capture<=axi_awaddr; aw_seen<=1; end
+                if (axi_wvalid && axi_wready) begin w_capture<=axi_wdata; wstrb_capture<=axi_wstrb; w_seen<=1; end
+                if ((aw_seen || (axi_awvalid && axi_awready)) && (w_seen || (axi_wvalid && axi_wready))) begin
+                    r_addr  <= aw_seen ? aw_capture : axi_awaddr;
+                    r_wdata <= w_seen  ? w_capture  : axi_wdata;
+                    r_mask  <= w_seen  ? wstrb_capture : axi_wstrb;
+                    is_write<=1; st<=S_SEND; aw_seen<=0; w_seen<=0;
+                end else if (axi_arvalid && !axi_awvalid && !aw_seen && !w_seen) begin
                     r_addr<=axi_araddr; is_write<=0; st<=S_SEND;
                 end
             end
