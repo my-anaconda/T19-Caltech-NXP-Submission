@@ -547,11 +547,44 @@ def fix_crossbar_s0_window(yaml_paths):
             break  # only ever touch the FIRST size: line (S0)
 
 
+def fix_ahb_bridge_hprot(top_level_verilog):
+    """Force the ahb_to_apb_bridge instantiation's hprot tie-off to have
+    bit0 set, in the Step-4 LLM-generated top-level Verilog text.
+
+    apb_fabric's own generator (gen_apb_fabric / gen_apb_fabric_v2) gates
+    its privileged slot (S3, apb_timer0 per the architecture doc's address
+    map) on `m_pprot[0]` - the bridge passes hprot straight through to
+    pprot unmodified. But this SoC's CPU-facing AXI4-Lite port has no
+    privilege signal at all, so the Step-4 top-level has nothing to base
+    hprot on and just ties it to a constant - observed as 3'b000 in a
+    real generation (t19_hard_test9), which makes bit0 permanently 0 and
+    therefore makes apb_timer0 PERMANENTLY unreachable via the documented
+    global CPU address map (confirmed via a real simulation: a LOAD0/CTRL0
+    write to timer0 silently misses - m_prdata reads back the fabric's own
+    DEAD_BEEF miss sentinel - regardless of address correctness). Since
+    this architecture never defines more than one CPU master, "always
+    privileged" is the only sane interpretation and is safe SoC-wide (no
+    other logic reads hprot/pprot) - so this is corrected deterministically
+    here rather than depending on the LLM guessing a privilege value it
+    was never given any basis to infer.
+    """
+    def repl(m):
+        return m.group(1) + "3'b001" + m.group(3)
+    fixed, n = re.subn(r'(\.hprot\()([^)]*)(\))', repl, top_level_verilog, count=1)
+    if n:
+        print("[FIX] Top-level: forced ahb_to_apb_bridge's hprot tie-off to "
+              "3'b001 (bit0=1) - apb_fabric's privileged slot (timer0) is "
+              "otherwise permanently unreachable, since this SoC's CPU port "
+              "has no privilege signal for the LLM to have wired hprot from.",
+              file=sys.stderr)
+    return fixed
+
+
 def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
     """Call rtl_gen_main.py --spec <yaml> --outdir <dir>. Returns generated filenames."""
     yaml_text = Path(yaml_path).read_text(encoding="utf-8")
     spec = _parse_flat_yaml(yaml_text)
-    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128"):
+    if spec.get("ip_type") in ("tilelink_router", "axi_lite_sram", "tilelink_ni", "aes128", "apb_fabric"):
         # Use the corrected, verified generators instead of shelling out to
         # the organizer's ones - see module-level comment above. Imported
         # lazily (not at module load time) because these generators import
@@ -574,6 +607,9 @@ def rtl_gen_from_yaml(yaml_path, rtl_gen_lib_dir, out_dir):
         elif spec["ip_type"] == "tilelink_ni":
             from gen_ni_v2 import gen_tilelink_ni_v2
             files = gen_tilelink_ni_v2(spec)
+        elif spec["ip_type"] == "apb_fabric":
+            from gen_apb_fabric_v2 import gen_apb_fabric_v2
+            files = gen_apb_fabric_v2(spec)
         else:
             from gen_aes_v2 import gen_aes128_v2
             files = gen_aes128_v2(spec)
@@ -811,6 +847,8 @@ Do not include long explanations outside the code block.
     if not top_level_verilog:
         print("[ERROR] Model failed to output Verilog for the top-level module.", file=sys.stderr)
         sys.exit(1)
+    if ".hprot(" in top_level_verilog:
+        top_level_verilog = fix_ahb_bridge_hprot(top_level_verilog)
     if "endmodule" not in top_level_verilog:
         # No closing fence AND no endmodule = the response was truncated
         # mid-file (hit max_output_tokens before finishing), not just missing

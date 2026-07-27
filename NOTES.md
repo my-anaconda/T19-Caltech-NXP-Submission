@@ -940,3 +940,88 @@ this is purely a top-level-integration gap, isolated the same way the
 NoC-mesh-stubbing gap was earlier in this project - worth a dedicated
 prompt-guidance pass later, but not necessary for continuing to the
 remaining categories.
+
+## `apb_periph` category (T601-T606) - a real generator bug, a real BFM/bridge
+## timing mismatch, and a real top-level privilege-wiring gap
+
+Unlike `aes_basic`/`dma_basic`, the architecture doc's APB peripheral
+cluster (base `0xF000_0000`, 4KB/slot: `apb_uart`/`apb_gpio0`/`apb_gpio1`/
+`apb_timer0`/`apb_watchdog`) is documented as CPU-reachable through the
+real path (crossbar S1 -> `ahb_to_apb_bridge` -> `apb_fabric5` ->
+peripheral) - so `tb_hard_apb_periph.v` exercises that entire real path
+via the CPU BFM, no `force`/`release` shortcuts, unlike the two
+categories before it.
+
+**Bug #1 - `apb_fabric`'s slot decode, found by reading the generator
+source before writing any testbench code.** `gen_apb_ips.py`'s
+`gen_apb_fabric` decodes which of its 5 slots to select with
+`m_paddr[31:12] == 20'h0..4` - i.e. it assumes `m_paddr` has already been
+re-based to a LOCAL 0-origin address space. Traced the real wiring
+(crossbar's S1 window -> bridge's `haddr` -> fabric's `m_paddr`, all
+unmodified passthroughs, confirmed against `t19_hard_test9`'s actual
+`crypto_soc.v`) - the address arriving here is always the full, global
+`0xF000_xxxx` address, so `m_paddr[31:12]` is always `0xF000x`, never
+matching `dec0..dec4`'s 0-4. Every APB peripheral access would
+permanently miss, structurally, regardless of address or peripheral.
+Confirmed empirically first (ran the new testbench against the
+unpatched `t19_hard_test9`: 0/6, exactly as predicted) before writing any
+fix. Fixed in a new `gen_apb_fabric_v2.py`: decode against
+`m_paddr[15:12]` (the slot nibble within the fixed 64KB S1 window)
+instead - everything else in the fabric (per-slot routing, the S3
+privilege filter, timeout/miss/pslverr logic) is unchanged.
+
+**Bug #2 - a fused/premature `bvalid`/`rvalid` ack in the AHB bridge
+glue, found only after the decode fix alone still scored 0/6.** A real
+signal trace showed `cpu_bvalid` pulsing the SAME cycle as `cpu_awready`
+- a fused, immediate ack - well before the bridge's real 3-cycle
+`ST_IDLE -> ST_SETUP -> ST_ENABLE` transaction has even sampled `hwdata`
+(one cycle later, in `ST_SETUP`) let alone reached the peripheral. The
+shared `axi_write`/`axi_read` tasks (`tb_hard_common.vh`) hold
+awvalid/wvalid through bvalid, which is correct for the local-SRAM path
+but is now too *long* here: holding awvalid any further than one extra
+settling cycle lets the bridge cycle back to `ST_IDLE` while awvalid is
+still asserted, and it captures the SAME address a SECOND time with
+stale/zero wdata - silently re-writing the just-written register back to
+0 (confirmed directly: a real trace showed a clean, correct write pulse
+immediately followed by a second phantom pulse at the same address with
+`pwdata=0`). The read side has the mirror problem: `rvalid` fires before
+the real `hrdata` register is updated, so a read captured at the first
+`rvalid` pulse returns a stale/previous value. Rather than touch the
+shared BFM (unmodified and working for every other passing category),
+`tb_hard_apb_periph.v` defines two local tasks: `apb_write` (holds wdata
+for exactly one extra cycle past acceptance, then drops everything at
+once, never re-checking bvalid since it already fired) and `apb_read`
+(holds arvalid several extra cycles past acceptance before trusting
+`cpu_rdata` - safe for reads, unlike writes, since a repeat read of the
+same address is idempotent).
+
+**Bug #3 - a top-level privilege-wiring gap, found from T605 (timer0)
+still failing after both fixes above.** A trace showed `s3_psel` never
+asserting and the fabric's own `DEAD_BEEF` miss-sentinel coming back on
+read - `apb_fabric`'s privilege filter (`priv_err = dec3 && !pprot[0]`)
+permanently blocks its one privileged slot (S3 = `apb_timer0`, per the
+doc's own address table) because the top-level ties the AHB bridge's
+`hprot` to a constant `3'b000`: this SoC's CPU-facing AXI4-Lite port
+carries no privilege signal at all, so the Step-4 LLM has no basis to
+infer anything else. Since this architecture never defines more than one
+CPU master, "always privileged" is the only sane reading and is safe
+SoC-wide (nothing else reads hprot/pprot) - fixed with a deterministic
+top-level post-processing step, `fix_ahb_bridge_hprot()`, that forces the
+bridge's `.hprot(...)` tie-off to `3'b001` right after Step 4 extracts
+the generated Verilog, the same "don't depend on the LLM guessing it
+right every time" philosophy already used for the crossbar's S0 window.
+
+Tests: T601 UART TX FIFO write reaches the peripheral through the real
+global address (slot 0); T602/T604 GPIO0/GPIO1 DIR+OUT drive the real
+top-level tristate pads (the ultimate external observable); T603 GPIO0
+IN - drives the pad externally and confirms `GPIO_IN` reflects it back
+through the debounce synchronizer via a real CPU read; T605 timer0 LOAD0/
+CTRL0 configured and `VALUE0` observed counting down for real over the
+privileged slot; T606 watchdog unlock/load/enable and the real counter
+(`ctr`) observed decrementing.
+
+**Verified end-to-end on yet another fresh, fully unpatched regeneration
+(`t19_hard_test10`, all three fixes wired in from the start)**: all six
+categories together via `run_suite.sh` - `reset_sync` (5/5), `noc_local`
+(6/6), `noc_routing` (10/10), `aes_basic` (8/8), `dma_basic` (10/10),
+`apb_periph` (6/6) - **45/45 passing**, zero manual RTL edits.
